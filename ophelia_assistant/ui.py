@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import logging
 import os
@@ -12,8 +11,9 @@ import time
 import tkinter as tk
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import requests
 
@@ -22,7 +22,6 @@ from PIL import Image, ImageOps, ImageTk
 from . import __version__
 from .config import (
     BATCH_CONTACT_ROWS,
-    BATCH_DRAFT_INTERVAL_SECONDS,
     DEFAULT_BODY_TEMPLATE,
     DEFAULT_SENDER_NAME,
     DEFAULT_SUBJECT_TEMPLATE,
@@ -33,8 +32,9 @@ from .config import (
     next_custom_variable_key,
     normalize_window_sequence,
     resolve_task_windows,
+    resolve_task_windows_balanced,
 )
-from .database import Database
+from .database import Database, now_iso
 from .i18n import LANGUAGES, current_language, set_language, tr, trf
 from .morelogin import BROWSER_PROVIDER_NAMES, create_browser_provider
 from .operation import OperationCancelledError, OperationController
@@ -58,19 +58,83 @@ SYSTEM_VARIABLES = (
     ("location", "城市或城市地区"),
     ("sender_name", "发件人姓名"),
 )
-INK = "#152A26"
-MUTED = "#5F6B66"
-PAPER = "#F9F5EC"
-PANEL = "#ECE6D8"
-LINE = "#C9C0AC"
-GOLD = "#9A7B34"
-GOLD_DARK = "#2F5A4D"
-RED = "#A33B2B"
-GREEN = "#376A5C"
-HEADER = "#102420"
-SIDEBAR = "#142E27"
-SIDEBAR_HOVER = "#24493D"
+INK = "#0F172A"
+MUTED = "#5B6B83"
+PAPER = "#FFFFFF"
+PANEL = "#EEF3FA"
+LINE = "#E3EAF3"
+GOLD = "#2563EB"
+GOLD_DARK = "#1E40AF"
+RED = "#EF4444"
+GREEN = "#10B981"
+HEADER = "#0B1526"
+SIDEBAR = "#0B1526"
+SIDEBAR_HOVER = "#12203A"
+SURFACE = "#F8FAFD"
+AMBER = "#F59E0B"
+SKY = "#0EA5E9"
 APP_VERSION = f"v{__version__}"
+
+
+DEFAULT_THEMES: dict[str, dict[str, str]] = {
+    "light": {
+        "ink": "#101827",
+        "muted": "#5C6B84",
+        "paper": "#FFFFFF",
+        "panel": "#EFF3F8",
+        "line": "#E1E8F1",
+        "gold": "#2563EB",
+        "gold_dark": "#1E40AF",
+        "red": "#EF4444",
+        "green": "#16A34A",
+        "header": "#16233F",
+        "sidebar": "#16233F",
+        "sidebar_hover": "#1F2F52",
+        "surface": "#F7F9FC",
+        "amber": "#F59E0B",
+        "sky": "#0EA5E9",
+    },
+    "dark": {
+        "ink": "#E8EEF8",
+        "muted": "#8FA1BC",
+        "paper": "#141F36",
+        "panel": "#0D1526",
+        "line": "#26354F",
+        "gold": "#4D8DFF",
+        "gold_dark": "#2F6BE0",
+        "red": "#F87171",
+        "green": "#34D399",
+        "header": "#0A1122",
+        "sidebar": "#0A1122",
+        "sidebar_hover": "#12203A",
+        "surface": "#18243D",
+        "amber": "#FBBF24",
+        "sky": "#38BDF8",
+    },
+}
+
+
+def apply_theme(settings) -> None:
+    """Apply the selected theme and custom skin to the UI color tokens."""
+    global INK, MUTED, PAPER, PANEL, LINE, GOLD, GOLD_DARK
+    global RED, GREEN, HEADER, SIDEBAR, SIDEBAR_HOVER, SURFACE, AMBER, SKY
+    tokens = dict(DEFAULT_THEMES.get(settings.theme_mode, DEFAULT_THEMES["light"]))
+    tokens.update(settings.skin_colors or {})
+    INK = tokens["ink"]
+    MUTED = tokens["muted"]
+    PAPER = tokens["paper"]
+    PANEL = tokens["panel"]
+    LINE = tokens["line"]
+    GOLD = tokens["gold"]
+    GOLD_DARK = tokens["gold_dark"]
+    RED = tokens["red"]
+    GREEN = tokens["green"]
+    HEADER = tokens["header"]
+    SIDEBAR = tokens["sidebar"]
+    SIDEBAR_HOVER = tokens["sidebar_hover"]
+    SURFACE = tokens["surface"]
+    AMBER = tokens["amber"]
+    SKY = tokens["sky"]
 
 
 class _ReusableExecutor:
@@ -90,43 +154,6 @@ class _ReusableExecutor:
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=True)
-
-
-def parse_contacts_csv(path: str) -> list[dict[str, str]]:
-    """Read a contact CSV into normalized dict rows (name/location/email/custom_*)."""
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        raw_rows = list(reader)
-
-    def cell(row: dict, *names: str) -> str:
-        lowered = {
-            str(key).strip().lower(): str(value or "").strip()
-            for key, value in row.items()
-        }
-        for name in names:
-            value = lowered.get(name.lower())
-            if value:
-                return value
-        return ""
-
-    entries: list[dict[str, str]] = []
-    for row in raw_rows:
-        entry = {
-            "name": cell(row, "名字", "name", "姓名"),
-            "location": cell(row, "地区", "location", "城市", "city"),
-            "email": cell(row, "邮箱", "email", "邮箱地址", "mail"),
-        }
-        if not (entry["name"] or entry["location"] or entry["email"]):
-            continue
-        lowered = {
-            str(key).strip().lower(): str(value or "").strip()
-            for key, value in row.items()
-        }
-        for key, value in lowered.items():
-            if key.startswith("custom_") or key.startswith("变量"):
-                entry[key] = value
-        entries.append(entry)
-    return entries
 
 
 def parse_contacts_xlsx(path: str) -> list[dict[str, str]]:
@@ -199,7 +226,7 @@ class App(tk.Tk):
         self.title(f"{tr('牛马邮箱')} · {APP_VERSION}")
         self.geometry("1280x820")
         self.minsize(1080, 700)
-        self.configure(bg=INK)
+        self.configure(bg=PANEL)
 
         self._resize_job = None
         self._refresh_job = None
@@ -207,25 +234,26 @@ class App(tk.Tk):
         self._row_snapshots: dict[int, tuple] = {}
         self._all_rows = []
         self._load_brand_assets()
+        self.settings = Settings.load()
+        set_language(self.settings.language)
+        apply_theme(self.settings)
         self._configure_styles()
         self._build_background()
         self._trial_status = check_trial()
         self.db = Database()
         self.db.backup()
         self._last_failed_task_ids: set[int] = set()
-        self.settings = Settings.load()
-        set_language(self.settings.language)
         self._patch_messagebox()
         self.workflow = Workflow(self.db, self.settings)
         self.operations = OperationController()
         self._operation_busy = False
         self._operation_buttons: list[ttk.Button] = []
         self._test_busy = False
+        self._busy_watchdog_job = None
         self._worker_pool = _ReusableExecutor(MAX_CONCURRENT_TASKS)
-        self._build_header()
         self._build_workspace()
         self._set_operation_busy(False)
-        self.refresh()
+        self.after_idle(self.refresh)
         self._translate_widgets()
         self._apply_authorization_state()
         if not self._trial_status.active:
@@ -255,7 +283,11 @@ class App(tk.Tk):
                         widget.configure(text=text)
             except tk.TclError:
                 pass
-            for child in widget.winfo_children():
+            try:
+                children = widget.winfo_children()
+            except tk.TclError:
+                children = []
+            for child in children:
                 walk(child)
 
         walk(self)
@@ -268,7 +300,11 @@ class App(tk.Tk):
         ):
             if notebook is None:
                 continue
-            for tab_id in notebook.tabs():
+            try:
+                tab_ids = notebook.tabs()
+            except tk.TclError:
+                continue
+            for tab_id in tab_ids:
                 original = self._tab_text_orig.get(tab_id)
                 if original is None:
                     original = str(notebook.tab(tab_id, "text") or "")
@@ -284,7 +320,11 @@ class App(tk.Tk):
             if tree is None:
                 continue
             tree_id = str(tree)
-            for column in tree["columns"]:
+            try:
+                columns = list(tree["columns"])
+            except tk.TclError:
+                continue
+            for column in columns:
                 original = self._heading_text_orig.get((tree_id, column))
                 if original is None:
                     original = str(tree.heading(column, "text") or "")
@@ -302,8 +342,17 @@ class App(tk.Tk):
             variable = getattr(self, attr, None)
             if variable is not None:
                 value = str(variable.get() or "")
-                if english and cjk.search(value):
-                    variable.set(tr(value))
+                if english:
+                    original = getattr(variable, "_niuma_orig_value", None)
+                    if original is None:
+                        original = value
+                        variable._niuma_orig_value = original
+                    if cjk.search(original):
+                        variable.set(tr(original))
+                else:
+                    original = getattr(variable, "_niuma_orig_value", None)
+                    if original is not None and value != original:
+                        variable.set(original)
 
     def _patch_messagebox(self) -> None:
         import tkinter.messagebox as mb
@@ -370,9 +419,7 @@ class App(tk.Tk):
         except (OSError, tk.TclError):
             self._window_icon = None
             self._header_icon = None
-        self._background_source = Image.open(
-            resource_path("assets/shanshui-jianghu-bg.png")
-        ).convert("RGB")
+        self._background_source = None
         try:
             contact_qr = Image.open(resource_path("assets/telegram-ls0514.png")).convert("RGB")
             contact_qr = ImageOps.contain(contact_qr, (230, 290), method=Image.Resampling.LANCZOS)
@@ -388,7 +435,7 @@ class App(tk.Tk):
         style.configure("App.TNotebook", background=PANEL, borderwidth=0, tabmargins=(8, 8, 8, 0))
         style.configure(
             "App.TNotebook.Tab",
-            background="#DED6C4",
+            background="#E8EFFA",
             foreground=MUTED,
             padding=(24, 12),
             font=("Microsoft YaHei UI", 10, "bold"),
@@ -400,30 +447,46 @@ class App(tk.Tk):
             background=PAPER,
             fieldbackground=PAPER,
             foreground=INK,
-            rowheight=36,
+            rowheight=38,
             borderwidth=0,
             font=("Microsoft YaHei UI", 9),
         )
         style.configure(
             "App.Treeview.Heading",
-            background="#DCD5C4",
+            background="#E8EFFA",
             foreground=INK,
             relief="flat",
             padding=(10, 10),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
-        style.map("App.Treeview", background=[("selected", "#C5D6CC")], foreground=[("selected", INK)])
-        style.configure("Primary.TButton", background=GOLD, foreground="#FFFFFF", padding=(18, 10), borderwidth=0, font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("App.Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", INK)])
+        style.configure("Primary.TButton", background=GOLD, foreground="#FFFFFF", padding=(18, 10), borderwidth=1, bordercolor=GOLD, font=("Microsoft YaHei UI", 9, "bold"))
         style.map("Primary.TButton", background=[("active", GOLD_DARK), ("pressed", GOLD_DARK)])
-        style.configure("Danger.TButton", background=RED, foreground="#FFFFFF", padding=(16, 10), borderwidth=0, font=("Microsoft YaHei UI", 9, "bold"))
-        style.map("Danger.TButton", background=[("active", "#7E2B20")])
-        style.configure("Soft.TButton", background="#D9D2C2", foreground=INK, padding=(14, 10), borderwidth=0, font=("Microsoft YaHei UI", 9))
-        style.map("Soft.TButton", background=[("active", "#C6D2C8")])
-        style.configure("App.TEntry", fieldbackground="#FFFDF7", bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, padding=9)
-        style.configure("App.TSpinbox", fieldbackground="#FFFDF7", bordercolor=LINE, padding=8)
+        style.configure("Danger.TButton", background=RED, foreground="#FFFFFF", padding=(16, 10), borderwidth=1, bordercolor=RED, font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Danger.TButton", background=[("active", "#B91C1C")])
+        style.configure("Soft.TButton", background="#FFFFFF", foreground=INK, padding=(14, 10), borderwidth=1, bordercolor=LINE, font=("Microsoft YaHei UI", 9))
+        style.map("Soft.TButton", background=[("active", "#E2E8F0")])
+        style.configure("App.TEntry", fieldbackground="#FFFFFF", bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, padding=9)
+        style.configure("App.TSpinbox", fieldbackground="#FFFFFF", bordercolor=LINE, padding=8)
+        style.configure(
+            "TCombobox",
+            fieldbackground="#FFFFFF",
+            background="#FFFFFF",
+            bordercolor=LINE,
+            lightcolor=LINE,
+            darkcolor=LINE,
+            arrowcolor=GOLD,
+            padding=7,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#FFFFFF")],
+            selectbackground=[("readonly", "#FFFFFF")],
+            selectforeground=[("readonly", INK)],
+        )
 
     def _build_background(self) -> None:
-        self.background_label = tk.Label(self, bd=0, highlightthickness=0)
+        self.background_label = tk.Label(self, bd=0, highlightthickness=0, bg=PANEL)
         self.background_label.place(x=0, y=0, relwidth=1, relheight=1)
         self.bind("<Configure>", self._schedule_background_render)
         self.after_idle(self._render_background)
@@ -435,41 +498,59 @@ class App(tk.Tk):
 
     def _render_background(self) -> None:
         self._resize_job = None
-        width = max(1, self.winfo_width())
-        height = max(1, self.winfo_height())
-        fitted = ImageOps.fit(self._background_source, (width, height), method=Image.Resampling.BILINEAR)
-        self._background_photo = ImageTk.PhotoImage(fitted)
-        self.background_label.configure(image=self._background_photo)
+        image_path = ""
+        if hasattr(self, "settings"):
+            image_path = str(getattr(self.settings, "background_image", "") or "")
+        if image_path and os.path.isfile(image_path):
+            try:
+                width = max(1, self.winfo_width())
+                height = max(1, self.winfo_height())
+                fitted = ImageOps.fit(
+                    Image.open(image_path).convert("RGB"),
+                    (width, height),
+                    method=Image.Resampling.BILINEAR,
+                )
+                self._background_photo = ImageTk.PhotoImage(fitted)
+                self.background_label.configure(image=self._background_photo, bg=PANEL)
+            except (OSError, tk.TclError):
+                self.background_label.configure(image="", bg=PANEL)
+        else:
+            self.background_label.configure(image="", bg=PANEL)
         self.background_label.lower()
 
     def _build_header(self) -> None:
-        header = tk.Frame(self, bg=HEADER, height=92, bd=0)
+        header = tk.Frame(
+            self, bg=PANEL, height=52, bd=0,
+            highlightthickness=1, highlightbackground=LINE,
+        )
         header.place(x=0, y=0, relwidth=1)
         header.pack_propagate(False)
-        brand = tk.Frame(header, bg=HEADER)
-        brand.pack(side="left", padx=30, pady=12)
-        if self._header_icon:
-            tk.Label(brand, image=self._header_icon, bg=HEADER, bd=0).pack(side="left", padx=(0, 14))
-        title_box = tk.Frame(brand, bg=HEADER)
-        title_box.pack(side="left")
-        tk.Label(title_box, text=tr("牛马邮箱"), bg=HEADER, fg="#F5EEDC", font=("KaiTi", 24, "bold")).pack(anchor="w")
-        tk.Label(title_box, text=tr("山水江湖 · Gmail 本地草稿"), bg=HEADER, fg="#B9C9BF", font=("Microsoft YaHei UI", 9)).pack(anchor="w")
         self.connection_var = tk.StringVar(value=f"{tr(remaining_text(self._trial_status))} · {tr('本地模式')}")
-        tk.Label(header, textvariable=self.connection_var, bg=HEADER, fg="#D8C184", font=("Microsoft YaHei UI", 9, "bold")).pack(side="right", padx=30)
-        version_badge = tk.Frame(header, bg=RED, bd=0)
-        version_badge.pack(side="right", padx=(0, 4), pady=26)
-        tk.Label(version_badge, text=APP_VERSION, bg=RED, fg="#FFF7E8", padx=12, pady=5, font=("Segoe UI", 9, "bold")).pack()
+        tk.Label(
+            header, textvariable=self.connection_var, bg=PANEL, fg=MUTED,
+            font=("Microsoft YaHei UI", 9), padx=24,
+        ).pack(side="left")
+        tk.Label(
+            header, text=tr("跨境邮件营销自动化助手"), bg=PANEL, fg=MUTED,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(0, 24))
+        version_badge = tk.Frame(header, bg=GOLD, bd=0)
+        version_badge.pack(side="right", padx=16, pady=13)
+        tk.Label(
+            version_badge, text=APP_VERSION, bg=GOLD, fg="#FFFFFF",
+            padx=12, pady=4, font=("Segoe UI", 9, "bold"),
+        ).pack()
 
     def _build_workspace(self) -> None:
-        surface = tk.Frame(self, bg=PANEL, bd=0, highlightthickness=2, highlightbackground="#8F876F")
-        surface.place(relx=0.5, rely=0.56, anchor="center", relwidth=0.92, relheight=0.80)
+        self.shell = tk.Frame(self, bg=PANEL, bd=0)
+        self.shell.pack(fill="both", expand=True)
         self.lock_banner_var = tk.StringVar(value="")
-        self.lock_banner = tk.Frame(surface, bg=RED, bd=0)
+        self.lock_banner = tk.Frame(self.shell, bg=RED, bd=0)
         self.lock_banner_label = tk.Label(
             self.lock_banner,
             textvariable=self.lock_banner_var,
             bg=RED,
-            fg="#FFF7E8",
+            fg="#FFFFFF",
             cursor="hand2",
             padx=16,
             pady=8,
@@ -479,20 +560,38 @@ class App(tk.Tk):
         self.lock_banner_label.bind(
             "<Button-1>", lambda _event: self._select_page(self.settings_tab)
         )
-        shell = tk.Frame(surface, bg=PANEL)
-        shell.pack(fill="both", expand=True)
-        self.shell = shell
-        sidebar = tk.Frame(shell, bg=SIDEBAR, width=190)
+        self.shell_body = tk.Frame(self.shell, bg=PANEL)
+        self.shell_body.pack(fill="both", expand=True)
+        sidebar = tk.Frame(self.shell_body, bg=SIDEBAR, width=208)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
+        brand_box = tk.Frame(sidebar, bg=SIDEBAR)
+        brand_box.pack(fill="x", padx=16, pady=(18, 12))
+        brand_row = tk.Frame(brand_box, bg=SIDEBAR)
+        brand_row.pack(anchor="w")
+        if self._header_icon:
+            tk.Label(brand_row, image=self._header_icon, bg=SIDEBAR, bd=0).pack(
+                side="left", padx=(0, 10)
+            )
+        title_box = tk.Frame(brand_row, bg=SIDEBAR)
+        title_box.pack(side="left")
         tk.Label(
-            sidebar, text=tr("江 湖 行 笺"), bg=SIDEBAR, fg="#D8C184",
-            font=("KaiTi", 14, "bold"), anchor="w",
-        ).pack(fill="x", padx=20, pady=(20, 12))
-        content = tk.Frame(shell, bg=PANEL)
+            title_box, text=tr("牛马邮箱"), bg=SIDEBAR, fg="#FFFFFF",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            title_box, text=APP_VERSION, bg=SIDEBAR, fg="#7DB3FF",
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            brand_box, text=tr("跨境邮件自动化助手"), bg=SIDEBAR, fg="#93A4C0",
+            font=("Microsoft YaHei UI", 8),
+        ).pack(anchor="w", pady=(8, 0))
+        tk.Frame(brand_box, bg="#1E2A44", height=1).pack(fill="x", pady=(12, 0))
+        content = tk.Frame(self.shell_body, bg=PANEL)
         content.pack(side="left", fill="both", expand=True)
         self.notebook = ttk.Notebook(content, style="Sidebar.TNotebook")
-        self.notebook.pack(fill="both", expand=True, padx=6, pady=4)
+        self.notebook.pack(fill="both", expand=True, padx=0, pady=0)
         self.queue_tab = tk.Frame(self.notebook, bg=PANEL)
         self.batch_tab = tk.Frame(self.notebook, bg=PANEL)
         self.window_tab = tk.Frame(self.notebook, bg=PANEL)
@@ -507,34 +606,35 @@ class App(tk.Tk):
         self.notebook.add(self.settings_tab, text=tr("设置"))
         self._nav_buttons: dict[tk.Frame, tk.Button] = {}
         nav_specs = [
-            (self.queue_tab, tr("案牍工作台"), tr("任务、预览与批量执行")),
-            (self.batch_tab, tr("录入名帖"), tr("名字、地区与邮箱")),
-            (self.window_tab, tr("窗口阵列"), tr("动态增删，最多 30 个窗口")),
-            (self.history_tab, tr("往来旧册"), tr("查找与删除任务")),
-            (self.template_tab, tr("尺牍模板"), tr("主题与正文模板")),
-            (self.settings_tab, tr("系统设置"), tr("本地连接与发件人")),
+            (self.queue_tab, tr("案牍工作台")),
+            (self.batch_tab, tr("录入名帖")),
+            (self.window_tab, tr("窗口阵列")),
+            (self.history_tab, tr("往来旧册")),
+            (self.template_tab, tr("尺牍模板")),
+            (self.settings_tab, tr("系统设置")),
         ]
-        for page, title, hint in nav_specs:
-            box = tk.Frame(sidebar, bg=SIDEBAR)
-            box.pack(fill="x", padx=8, pady=2)
+        for page, title in nav_specs:
             button = tk.Button(
-                box, text=title, command=lambda target=page: self._select_page(target),
-                bg=SIDEBAR, fg="#F5EEDC", activebackground=SIDEBAR_HOVER,
+                sidebar, text=title, command=lambda target=page: self._select_page(target),
+                bg=SIDEBAR, fg="#FFFFFF", activebackground=SIDEBAR_HOVER,
                 activeforeground="#FFFFFF", relief="flat", bd=0, anchor="w",
-                padx=14, pady=8, font=("KaiTi", 12, "bold"),
+                padx=16, pady=9, font=("Microsoft YaHei UI", 10, "bold"),
                 cursor="hand2",
             )
-            button.pack(fill="x")
-            tk.Label(
-                box, text=hint, bg=SIDEBAR, fg="#9FB3AA", anchor="w",
-                font=("Microsoft YaHei UI", 7), padx=12,
-            ).pack(fill="x", pady=(0, 5))
+            button.pack(fill="x", padx=8, pady=2)
             self._nav_buttons[page] = button
         sidebar_footer = tk.Frame(sidebar, bg=SIDEBAR)
-        sidebar_footer.pack(side="bottom", fill="x", padx=16, pady=16)
-        tk.Frame(sidebar_footer, bg="#58766A", height=1).pack(fill="x", pady=(0, 10))
-        tk.Label(sidebar_footer, text=tr("一纸山河 · 万里传书"), bg=SIDEBAR, fg="#B8C7BE", font=("KaiTi", 9)).pack(anchor="w")
-        tk.Label(sidebar_footer, text=APP_VERSION, bg=SIDEBAR, fg="#D8C184", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(3, 0))
+        sidebar_footer.pack(side="bottom", fill="x", padx=16, pady=14)
+        tk.Frame(sidebar_footer, bg="#1E2A44", height=1).pack(fill="x", pady=(0, 10))
+        self.connection_var = tk.StringVar(
+            value=f"{tr(remaining_text(self._trial_status))} · {tr('本地模式')}"
+        )
+        tk.Label(
+            sidebar_footer, textvariable=self.connection_var, bg=SIDEBAR, fg="#7DB3FF",
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        tk.Label(sidebar_footer, text=tr("多窗口 · 批量触达 · 自动填写"), bg=SIDEBAR, fg="#94A3B8", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        tk.Label(sidebar_footer, text=APP_VERSION, bg=SIDEBAR, fg="#94A3B8", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 0))
         self._build_queue()
         self._build_batch_import()
         self._build_window_sequence()
@@ -544,7 +644,7 @@ class App(tk.Tk):
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._sync_nav())
         self._sync_nav()
         self.status_var = tk.StringVar(value="准备就绪")
-        status = tk.Label(surface, textvariable=self.status_var, bg="#DCD5C4", fg=MUTED, anchor="w", padx=16, pady=8, font=("Microsoft YaHei UI", 9))
+        status = tk.Label(self.shell, textvariable=self.status_var, bg="#E8EFFA", fg=MUTED, anchor="w", padx=16, pady=8, font=("Microsoft YaHei UI", 9))
         status.pack(fill="x", side="bottom")
 
     def _select_page(self, page) -> None:
@@ -571,12 +671,70 @@ class App(tk.Tk):
             )
         if hasattr(self, "history_tab") and selected is self.history_tab:
             self.refresh_history(self._all_rows or None)
+        if hasattr(self, "window_tab") and selected is self.window_tab:
+            self._refresh_window_template_options()
 
     def _card(self, parent, **grid_options) -> tk.Frame:
         card = tk.Frame(parent, bg=PAPER, bd=0, highlightthickness=1, highlightbackground=LINE)
         if grid_options:
             card.grid(**grid_options)
         return card
+
+    def _rebuild_ui(self) -> None:
+        """Recreate the whole window after theme/skin/language changes."""
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            self.unbind_all("<MouseWheel>")
+            for child in self.winfo_children():
+                child.destroy()
+            apply_theme(self.settings)
+            self._configure_styles()
+            self._build_background()
+            self._operation_buttons = []
+            self._build_workspace()
+            self._set_operation_busy(False)
+            self.after_idle(self.refresh)
+            self._translate_widgets()
+            self._apply_authorization_state()
+        except Exception as exc:
+            logger.exception("重建界面失败")
+            messagebox.showerror("应用主题失败", f"界面重建失败：{exc}\n\n请重启软件。")
+        finally:
+            self.config(cursor="")
+
+    def _enable_canvas_wheel(self, canvas, frame, axis: str = "y") -> None:
+        """Scroll a canvas region with the wheel even over its child widgets.
+
+        Uses sign-based steps so precision mice/trackpads (small delta values)
+        still scroll instead of being rounded down to zero.
+        """
+        active = {"on": False}
+
+        def _enter(_event) -> None:
+            active["on"] = True
+
+        def _leave(_event) -> None:
+            active["on"] = False
+
+        def _wheel(event):
+            if not active["on"]:
+                return None
+            if isinstance(event.widget, (tk.Text, ttk.Treeview)):
+                return None
+            steps = max(1, abs(event.delta) // 120)
+            direction = -steps if event.delta > 0 else steps
+            if axis == "x":
+                canvas.xview_scroll(direction, "units")
+            else:
+                canvas.yview_scroll(direction, "units")
+            return "break"
+
+        canvas.bind("<Enter>", _enter)
+        canvas.bind("<Leave>", _leave)
+        frame.bind("<Enter>", _enter)
+        frame.bind("<Leave>", _leave)
+        self.bind_all("<MouseWheel>", _wheel, add="+")
 
     def _build_queue(self) -> None:
         self.queue_tab.grid_columnconfigure(0, weight=1)
@@ -604,10 +762,10 @@ class App(tk.Tk):
                 variable=self.browser_provider_var,
                 command=self.switch_browser_provider,
                 indicatoron=False,
-                bg="#DDD5C2",
+                bg="#F1F5F9",
                 fg=INK,
-                selectcolor="#B9CFC3",
-                activebackground="#C8D7CC",
+                selectcolor="#DBEAFE",
+                activebackground="#DBEAFE",
                 activeforeground=INK,
                 relief="flat",
                 bd=0,
@@ -631,9 +789,9 @@ class App(tk.Tk):
         self.stat_vars = {key: tk.StringVar(value="0") for key in ("all", "new", "ready", "drafted")}
         stat_specs = [
             ("all", tr("全部任务"), GOLD),
-            ("new", tr("未生成"), "#6F7782"),
+            ("new", tr("未生成"), "#94A3B8"),
             ("ready", tr("待确认"), GREEN),
-            ("drafted", tr("Gmail 草稿"), "#8F6A3D"),
+            ("drafted", tr("Gmail 草稿"), "#0EA5E9"),
         ]
         for idx, (key, label, color) in enumerate(stat_specs):
             card = self._card(stats, row=0, column=idx, sticky="ew", padx=5)
@@ -716,6 +874,8 @@ class App(tk.Tk):
         self.retry_failed_button.state(["disabled"])
         self.mark_sent_button = ttk.Button(actions, text=tr("标记已发送"), style="Soft.TButton", command=self.mark_selected_sent)
         self.mark_sent_button.pack(side="left", padx=(6, 0))
+        self.unmark_sent_button = ttk.Button(actions, text=tr("撤销标记"), style="Soft.TButton", command=self.unmark_selected_sent)
+        self.unmark_sent_button.pack(side="left", padx=(6, 0))
         ttk.Button(actions, text=tr("删除"), style="Danger.TButton", command=self.delete_selected_queue_tasks).pack(side="right", padx=(6, 0))
         self._operation_buttons.extend(
             [
@@ -768,11 +928,11 @@ class App(tk.Tk):
 
         tk.Label(preview_card, text=tr("邮件预览"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=14, pady=(12, 2))
         tk.Label(preview_card, text=tr("发送前请在 Gmail 中逐封核对"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 8))
-        self.preview = tk.Text(preview_card, wrap="word", state="disabled", bg="#FBF8F5", fg=INK, relief="flat", highlightthickness=1, highlightbackground=LINE, padx=12, pady=12, font=("Microsoft YaHei UI", 9), spacing1=2, spacing3=4)
+        self.preview = tk.Text(preview_card, wrap="word", state="disabled", bg="#FFFFFF", fg=INK, relief="flat", highlightthickness=1, highlightbackground=LINE, padx=12, pady=12, font=("Microsoft YaHei UI", 9), spacing1=2, spacing3=4)
         self.preview.pack(fill="both", expand=True, padx=12, pady=(0, 6))
-        picker = tk.Frame(preview_card, bg="#E2DED0", highlightthickness=1, highlightbackground=LINE)
+        picker = tk.Frame(preview_card, bg="#F8FAFD", highlightthickness=1, highlightbackground=LINE)
         picker.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(picker, text=tr("选择发送窗口"), bg="#E2DED0", fg=INK, font=("Microsoft YaHei UI", 8, "bold")).pack(side="left", padx=(10, 6), pady=8)
+        tk.Label(picker, text=tr("选择发送窗口"), bg="#F8FAFD", fg=INK, font=("Microsoft YaHei UI", 8, "bold")).pack(side="left", padx=(10, 6), pady=8)
         self.profile_assign_var = tk.IntVar(value=1)
         ttk.Spinbox(picker, from_=1, to=999, textvariable=self.profile_assign_var, width=7, style="App.TSpinbox").pack(side="left", pady=5)
         self.window_picker_var = tk.StringVar()
@@ -781,6 +941,7 @@ class App(tk.Tk):
             textvariable=self.window_picker_var,
             state="readonly",
             width=16,
+            postcommand=self.auto_populate_picker_quiet,
         )
         self.window_picker_combo.pack(side="left", padx=(4, 0), pady=5)
         self.window_picker_combo.bind(
@@ -795,7 +956,7 @@ class App(tk.Tk):
         self.profile_assign_button = ttk.Button(picker, text=tr("确认浏览器窗口"), style="Soft.TButton", command=self.assign_profile_to_selected)
         self.profile_assign_button.pack(side="right", padx=8, pady=5)
         self.profile_assign_note_var = tk.StringVar(value=tr("请选择任务"))
-        tk.Label(picker, textvariable=self.profile_assign_note_var, bg="#E2DED0", fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
+        tk.Label(picker, textvariable=self.profile_assign_note_var, bg="#F8FAFD", fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
 
         editor = tk.Frame(preview_card, bg=PAPER, highlightthickness=1, highlightbackground=LINE)
         editor.pack(fill="x", padx=12, pady=(0, 6))
@@ -806,11 +967,14 @@ class App(tk.Tk):
         tk.Label(editor, text=tr("城市/城市地区"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).grid(row=2, column=0, sticky="w", padx=(9, 5), pady=3)
         self.manual_location_var = tk.StringVar()
         ttk.Entry(editor, textvariable=self.manual_location_var, style="App.TEntry").grid(row=2, column=1, sticky="ew", padx=(0, 9), pady=3)
-        tk.Label(editor, text=tr("自定义变量"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).grid(row=3, column=0, sticky="nw", padx=(9, 5), pady=3)
+        tk.Label(editor, text=tr("发件人名字"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).grid(row=3, column=0, sticky="w", padx=(9, 5), pady=3)
+        self.manual_sender_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.manual_sender_var, style="App.TEntry").grid(row=3, column=1, sticky="ew", padx=(0, 9), pady=3)
+        tk.Label(editor, text=tr("自定义变量"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).grid(row=4, column=0, sticky="nw", padx=(9, 5), pady=3)
         self.manual_custom_frame = tk.Frame(editor, bg=PAPER)
-        self.manual_custom_frame.grid(row=3, column=1, sticky="ew", padx=(0, 9), pady=3)
+        self.manual_custom_frame.grid(row=4, column=1, sticky="ew", padx=(0, 9), pady=3)
         self._render_manual_custom_fields()
-        ttk.Button(editor, text=tr("保存资料并重新生成"), style="Primary.TButton", command=self.save_manual_profile).grid(row=4, column=1, sticky="e", padx=9, pady=(5, 8))
+        ttk.Button(editor, text=tr("保存资料并重新生成"), style="Primary.TButton", command=self.save_manual_profile).grid(row=5, column=1, sticky="e", padx=9, pady=(5, 8))
         editor.grid_columnconfigure(1, weight=1)
 
     def _render_manual_custom_fields(self) -> None:
@@ -877,7 +1041,7 @@ class App(tk.Tk):
         card.grid_columnconfigure(0, weight=1)
 
         self._entry_fields = self._visible_entry_fields()
-        headings_frame = tk.Frame(card, bg="#DCD5C4")
+        headings_frame = tk.Frame(card, bg="#E8EFFA")
         headings_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=1, pady=(1, 4))
         for column, (_key, _label, weight) in enumerate(self._entry_fields, start=1):
             headings_frame.grid_columnconfigure(column, weight=weight)
@@ -903,6 +1067,7 @@ class App(tk.Tk):
             lambda event: rows_canvas.itemconfigure(rows_window, width=event.width),
         )
 
+        self._enable_canvas_wheel(rows_canvas, rows_frame)
         self.batch_rows_frame = rows_frame
         self._build_batch_rows()
         footer = tk.Frame(card, bg=PAPER)
@@ -975,23 +1140,23 @@ class App(tk.Tk):
 
             if not variable_keys:
                 continue
-            variable_box = tk.Frame(self.batch_rows_frame, bg="#F1EBDE", highlightthickness=1, highlightbackground=LINE)
+            variable_box = tk.Frame(self.batch_rows_frame, bg="#F8FAFD", highlightthickness=1, highlightbackground=LINE)
             variable_box.grid(row=top_row + 1, column=0, columnspan=total_columns, sticky="ew", padx=6, pady=(0, 6))
             tk.Label(
                 variable_box,
                 text=tr("自定义变量"),
-                bg="#F1EBDE",
+                bg="#F8FAFD",
                 fg=GREEN,
                 font=("Microsoft YaHei UI", 8, "bold"),
             ).grid(row=0, column=0, sticky="w", padx=(8, 6), pady=5)
             for column, key in enumerate(variable_keys, start=1):
                 variable_box.grid_columnconfigure(column, weight=1)
-                cell = tk.Frame(variable_box, bg="#F1EBDE")
+                cell = tk.Frame(variable_box, bg="#F8FAFD")
                 cell.grid(row=0, column=column, sticky="ew", padx=3)
                 tk.Label(
                     cell,
                     text=f"{{{key}}}",
-                    bg="#F1EBDE",
+                    bg="#F8FAFD",
                     fg=GOLD_DARK,
                     font=("Segoe UI", 8, "bold"),
                 ).pack(anchor="w")
@@ -1012,7 +1177,7 @@ class App(tk.Tk):
             tk.Label(
                 self.batch_headings_frame,
                 text=text,
-                bg="#DCD5C4",
+                bg="#E8EFFA",
                 fg=INK,
                 font=("Microsoft YaHei UI", 9, "bold"),
                 padx=8,
@@ -1025,7 +1190,7 @@ class App(tk.Tk):
         fields: list[tuple[str, str, int]],
         variable_keys: list[str],
     ) -> None:
-        bg = "#EAE6DB"
+        bg = "#F1F5F9"
         action_column = len(fields) + 1
         total_columns = action_column + 2
         tk.Label(
@@ -1226,6 +1391,13 @@ class App(tk.Tk):
             fg=MUTED,
             font=("Microsoft YaHei UI", 9),
         ).pack(side="left")
+        tk.Label(
+            toolbar,
+            text=tr("每行可绑定话术与发件人名字；窗口优先，未填时使用模板/全局变量"),
+            bg=PAPER,
+            fg=GOLD_DARK,
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(
             toolbar,
             text=tr("＋ 添加窗口"),
@@ -1256,6 +1428,7 @@ class App(tk.Tk):
             lambda event: rows_canvas.itemconfigure(rows_window, width=event.width),
         )
 
+        self._enable_canvas_wheel(rows_canvas, self.window_sequence_rows_frame)
         saved = list(self.settings.window_sequence)
         self.window_sequence_vars = [tk.StringVar(value=str(value)) for value in saved]
         self._render_window_sequence_rows()
@@ -1298,10 +1471,13 @@ class App(tk.Tk):
                 pady=28,
             ).grid(row=0, column=0, sticky="ew")
             return
+        self._window_template_vars: list[tk.StringVar] = []
+        self._window_template_combos: list[ttk.Combobox] = []
+        self._window_sender_vars: list[tk.StringVar] = []
         for index, variable in enumerate(self.window_sequence_vars):
             field_box = tk.Frame(
                 self.window_sequence_rows_frame,
-                bg="#FBF8F5",
+                bg="#FFFFFF",
                 highlightthickness=1,
                 highlightbackground=LINE,
             )
@@ -1310,7 +1486,7 @@ class App(tk.Tk):
             tk.Label(
                 field_box,
                 text=trf("顺序 {index}", index=index + 1),
-                bg="#FBF8F5",
+                bg="#FFFFFF",
                 fg=INK,
                 width=10,
                 anchor="w",
@@ -1324,12 +1500,42 @@ class App(tk.Tk):
                 style="App.TSpinbox",
                 width=16,
             ).grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=7)
+            binding: dict = {}
+            try:
+                binding = self.settings.window_bindings.get(
+                    str(int(str(variable.get()).strip()))
+                ) or {}
+            except ValueError:
+                pass
+            template_var = tk.StringVar(value=binding.get("template_name", ""))
+            sender_var = tk.StringVar(value=binding.get("sender_name", ""))
+            self._window_template_vars.append(template_var)
+            self._window_sender_vars.append(sender_var)
+            template_combo = ttk.Combobox(
+                field_box,
+                textvariable=template_var,
+                state="readonly",
+                values=[
+                    str(template.get("name", ""))
+                    for template in self.settings.saved_templates
+                    if template.get("name")
+                ],
+                width=16,
+            )
+            template_combo.grid(row=0, column=2, padx=(0, 6), pady=7)
+            self._window_template_combos.append(template_combo)
+            ttk.Entry(
+                field_box,
+                textvariable=sender_var,
+                style="App.TEntry",
+                width=18,
+            ).grid(row=0, column=3, padx=(0, 6), pady=7)
             ttk.Button(
                 field_box,
                 text=tr("删除"),
                 style="Danger.TButton",
                 command=lambda row_index=index: self.delete_window_sequence_row(row_index),
-            ).grid(row=0, column=2, padx=(0, 10), pady=6)
+            ).grid(row=0, column=4, padx=(0, 10), pady=6)
         self._translate_widgets()
 
     def add_window_sequence_row(self) -> None:
@@ -1339,6 +1545,21 @@ class App(tk.Tk):
         self.window_sequence_vars.append(tk.StringVar())
         self._render_window_sequence_rows()
         self.window_sequence_note_var.set(f"当前 {len(self.window_sequence_vars)} 个输入项")
+
+    def _refresh_window_template_options(self) -> None:
+        """Keep window-row template dropdowns in sync with saved templates."""
+        if not hasattr(self, "_window_template_combos"):
+            return
+        names = [
+            str(template.get("name", ""))
+            for template in self.settings.saved_templates
+            if template.get("name")
+        ]
+        for combo in self._window_template_combos:
+            current = combo.get()
+            combo["values"] = names
+            if current and current not in names:
+                combo.set("")
 
     def auto_fill_window_sequence(self) -> None:
         provider = create_browser_provider(self.settings)
@@ -1355,6 +1576,12 @@ class App(tk.Tk):
             )
             return
         numbers = [number for number, _name in windows][:MAX_WINDOW_SEQUENCE]
+        labels = [
+            f"{number} · {name}" if name else number
+            for number, name in windows
+        ]
+        if hasattr(self, "window_picker_combo"):
+            self.window_picker_combo["values"] = labels
         self.window_sequence_vars = [
             tk.StringVar(value=str(number)) for number in numbers
         ]
@@ -1377,8 +1604,10 @@ class App(tk.Tk):
         self.settings_sections.pack(fill="both", expand=True, padx=18, pady=10)
         self.settings_basic_tab = tk.Frame(self.settings_sections, bg=PANEL)
         self.settings_notice_tab = tk.Frame(self.settings_sections, bg=PANEL)
+        self.settings_theme_tab = tk.Frame(self.settings_sections, bg=PANEL)
         self.settings_sections.add(self.settings_basic_tab, text=tr("基础设置"))
         self.settings_sections.add(self.settings_notice_tab, text=tr("公告"))
+        self.settings_sections.add(self.settings_theme_tab, text=tr("外观主题"))
 
         card = self._card(self.settings_basic_tab)
         card.pack(anchor="nw", fill="x", padx=18, pady=12)
@@ -1388,18 +1617,19 @@ class App(tk.Tk):
         self.adspower_var = tk.StringVar(value=self.settings.adspower_url)
         self.adspower_api_key_var = tk.StringVar(value=self.settings.adspower_api_key)
         self.bitbrowser_var = tk.StringVar(value=self.settings.bitbrowser_url)
-        self.sender_var = tk.StringVar(value=self.settings.sender_name)
+        self.sender_var = getattr(self, "sender_var", None) or tk.StringVar(
+            value=self.settings.sender_name
+        )
         fields = [
             (tr("AdsPower API Key（可选）"), self.adspower_api_key_var, True),
-            (tr("发件人姓名"), self.sender_var, False),
         ]
         for idx, (label, var, secret) in enumerate(fields, start=2):
             tk.Label(card, text=label, bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=idx, column=0, sticky="w", padx=22, pady=4)
             ttk.Entry(card, textvariable=var, width=62, show="*" if secret else "", style="App.TEntry").grid(row=idx, column=1, sticky="ew", padx=(8, 24), pady=4)
-        tk.Label(card, text=tr("界面语言"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=4, column=0, sticky="w", padx=22, pady=4)
+        tk.Label(card, text=tr("界面语言"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=3, column=0, sticky="w", padx=22, pady=4)
         self.language_var = tk.StringVar(value=LANGUAGES[self.settings.language])
         language_line = tk.Frame(card, bg=PAPER)
-        language_line.grid(row=4, column=1, sticky="w", padx=(8, 24), pady=4)
+        language_line.grid(row=3, column=1, sticky="w", padx=(8, 24), pady=4)
         ttk.Combobox(
             language_line,
             textvariable=self.language_var,
@@ -1407,23 +1637,23 @@ class App(tk.Tk):
             values=list(LANGUAGES.values()),
             width=18,
         ).pack(side="left")
-        tk.Label(card, text=tr("当前版本"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=5, column=0, sticky="w", padx=22, pady=4)
+        tk.Label(card, text=tr("当前版本"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=4, column=0, sticky="w", padx=22, pady=4)
         version_line = tk.Frame(card, bg=PAPER)
-        version_line.grid(row=5, column=1, sticky="w", padx=(8, 24), pady=4)
-        tk.Label(version_line, text=APP_VERSION, bg=RED, fg="#FFF7E8", padx=10, pady=4, font=("Segoe UI", 9, "bold")).pack(side="left")
+        version_line.grid(row=4, column=1, sticky="w", padx=(8, 24), pady=4)
+        tk.Label(version_line, text=APP_VERSION, bg=RED, fg="#FFFFFF", padx=10, pady=4, font=("Segoe UI", 9, "bold")).pack(side="left")
         tk.Label(version_line, text="山水江湖主题版", bg=PAPER, fg=MUTED, font=("KaiTi", 10)).pack(side="left", padx=10)
-        tk.Label(card, text=tr("管理员授权"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=6, column=0, sticky="w", padx=22, pady=4)
+        tk.Label(card, text=tr("管理员授权"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=5, column=0, sticky="w", padx=22, pady=4)
         self.trial_remaining_var = tk.StringVar(value=tr(remaining_text(self._trial_status)))
-        tk.Label(card, textvariable=self.trial_remaining_var, bg=PAPER, fg=RED, font=("Microsoft YaHei UI", 9, "bold")).grid(row=6, column=1, sticky="w", padx=(8, 24), pady=4)
-        tk.Label(card, text=tr("本机设备码"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=7, column=0, sticky="w", padx=22, pady=4)
+        tk.Label(card, textvariable=self.trial_remaining_var, bg=PAPER, fg=RED, font=("Microsoft YaHei UI", 9, "bold")).grid(row=5, column=1, sticky="w", padx=(8, 24), pady=4)
+        tk.Label(card, text=tr("本机设备码"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=6, column=0, sticky="w", padx=22, pady=4)
         device_line = tk.Frame(card, bg=PAPER)
-        device_line.grid(row=7, column=1, sticky="ew", padx=(8, 24), pady=4)
+        device_line.grid(row=6, column=1, sticky="ew", padx=(8, 24), pady=4)
         self.device_code_var = tk.StringVar(value=device_code())
         ttk.Entry(device_line, textvariable=self.device_code_var, state="readonly", width=42, style="App.TEntry").pack(side="left", fill="x", expand=True)
         ttk.Button(device_line, text=tr("复制设备码"), style="Soft.TButton", command=self.copy_device_code).pack(side="left", padx=(8, 0))
-        tk.Label(card, text=tr("管理员验证码"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=8, column=0, sticky="nw", padx=22, pady=4)
+        tk.Label(card, text=tr("管理员验证码"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9)).grid(row=7, column=0, sticky="nw", padx=22, pady=4)
         code_line = tk.Frame(card, bg=PAPER)
-        code_line.grid(row=8, column=1, sticky="ew", padx=(8, 24), pady=4)
+        code_line.grid(row=7, column=1, sticky="ew", padx=(8, 24), pady=4)
         self.authorization_code_var = tk.StringVar()
         ttk.Entry(code_line, textvariable=self.authorization_code_var, style="App.TEntry").pack(side="left", fill="x", expand=True)
         ttk.Button(code_line, text=tr("立即验证"), style="Primary.TButton", command=self.verify_admin_code).pack(side="left", padx=(8, 0))
@@ -1435,9 +1665,9 @@ class App(tk.Tk):
             wraplength=690,
             justify="left",
             font=("Microsoft YaHei UI", 8),
-        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=22, pady=(2, 5))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=22, pady=(2, 5))
         actions = tk.Frame(card, bg=PAPER)
-        actions.grid(row=10, column=1, sticky="w", padx=(8, 24), pady=(5, 14))
+        actions.grid(row=9, column=1, sticky="w", padx=(8, 24), pady=(5, 14))
         ttk.Button(actions, text=tr("保存设置"), style="Soft.TButton", command=self.save_settings).pack(side="left")
         ttk.Button(actions, text=tr("检查更新"), style="Soft.TButton", command=self.check_for_update).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text=tr("查看日志"), style="Soft.TButton", command=self.show_log_viewer).pack(side="left", padx=(8, 0))
@@ -1480,6 +1710,130 @@ class App(tk.Tk):
             style="Primary.TButton",
             command=self.copy_admin_contact,
         ).pack(pady=(0, 16))
+        self._build_theme_settings()
+
+    def _build_theme_settings(self) -> None:
+        card = self._card(self.settings_theme_tab)
+        card.pack(anchor="nw", fill="x", padx=18, pady=12)
+        tk.Label(
+            card, text=tr("外观主题"), bg=PAPER, fg=INK,
+            font=("Microsoft YaHei UI", 14, "bold"),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=20, pady=(14, 4))
+        tk.Label(
+            card, text=tr("深浅色 + 自定义皮肤，保存后立即应用到全部页面"),
+            bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8),
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=20, pady=(0, 10))
+
+        tk.Label(
+            card, text=tr("界面明暗"), bg=PAPER, fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).grid(row=2, column=0, sticky="w", padx=20, pady=6)
+        mode_line = tk.Frame(card, bg=PAPER)
+        mode_line.grid(row=2, column=1, sticky="w", padx=(8, 20), pady=6)
+        ttk.Button(
+            mode_line, text=tr("浅色"), style="Soft.TButton",
+            command=lambda: self._set_theme_mode("light"),
+        ).pack(side="left")
+
+        tk.Label(
+            card, text=tr("皮肤预设"), bg=PAPER, fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).grid(row=3, column=0, sticky="w", padx=20, pady=6)
+        presets = [
+            ("比特风浅色", {"gold": "#2563EB", "paper": "#FFFFFF", "panel": "#EFF3F8", "sidebar": "#16233F"}),
+            ("紫橙新潮", {"gold": "#7C3AED", "paper": "#FFFFFF", "panel": "#F5F2FF", "sidebar": "#221A3A"}),
+            ("翡翠绿", {"gold": "#0F766E", "paper": "#FFFFFF", "panel": "#EDF7F4", "sidebar": "#0B3B34"}),
+        ]
+        preset_line = tk.Frame(card, bg=PAPER)
+        preset_line.grid(row=3, column=1, sticky="w", padx=(8, 20), pady=6)
+        for name, colors in presets:
+            ttk.Button(
+                preset_line, text=tr(name), style="Soft.TButton",
+                command=lambda label=name, palette=colors: self._apply_preset_skin(label, palette),
+            ).pack(side="left", padx=(0, 8))
+
+        tk.Label(
+            card, text=tr("自定义颜色"), bg=PAPER, fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).grid(row=4, column=0, sticky="w", padx=20, pady=6)
+        color_line = tk.Frame(card, bg=PAPER)
+        color_line.grid(row=4, column=1, sticky="w", padx=(8, 20), pady=6)
+        current = {
+            "gold": GOLD, "paper": PAPER, "panel": PANEL,
+            "sidebar": SIDEBAR, "ink": INK,
+        }
+        self._skin_color_vars: dict[str, tk.StringVar] = {}
+        self._skin_swatches: dict[str, tk.Label] = {}
+        for key, label in (
+            ("gold", "主色"), ("paper", "卡片"), ("panel", "页面"),
+            ("sidebar", "侧栏"), ("ink", "文字"),
+        ):
+            cell = tk.Frame(color_line, bg=PAPER)
+            cell.pack(side="left", padx=(0, 10))
+            var = tk.StringVar(value=current[key])
+            self._skin_color_vars[key] = var
+            tk.Label(cell, text=tr(label), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack()
+            swatch = tk.Label(
+                cell, text=var.get(), bg=var.get(), fg="#FFFFFF",
+                width=7, cursor="hand2", font=("Consolas", 8, "bold"),
+            )
+            swatch.pack(pady=2)
+            self._skin_swatches[key] = swatch
+            swatch.bind(
+                "<Button-1>",
+                lambda _event, color_key=key: self._pick_skin_color(color_key),
+            )
+
+        actions = tk.Frame(card, bg=PAPER)
+        actions.grid(row=5, column=0, columnspan=4, sticky="w", padx=20, pady=(10, 16))
+        ttk.Button(
+            actions, text=tr("保存并应用"), style="Primary.TButton",
+            command=self._apply_skin_settings,
+        ).pack(side="left")
+        ttk.Button(
+            actions, text=tr("恢复默认"), style="Soft.TButton",
+            command=self._reset_skin,
+        ).pack(side="left", padx=(8, 0))
+        card.grid_columnconfigure(1, weight=1)
+
+    def _pick_skin_color(self, key: str) -> None:
+        initial = self._skin_color_vars[key].get()
+        _rgb, hex_color = colorchooser.askcolor(
+            initial, parent=self, title="选择颜色"
+        )
+        if hex_color:
+            self._skin_color_vars[key].set(hex_color)
+            self._skin_swatches[key].configure(bg=hex_color, text=hex_color)
+
+    def _set_theme_mode(self, mode: str) -> None:
+        self.settings.theme_mode = mode
+        self.settings.save()
+        self._rebuild_ui()
+
+    def _apply_preset_skin(self, name: str, palette: dict[str, str]) -> None:
+        self.settings.skin_name = name
+        self.settings.skin_colors = dict(palette)
+        self.settings.save()
+        self._rebuild_ui()
+
+    def _apply_skin_settings(self) -> None:
+        colors = {
+            key: var.get().strip()
+            for key, var in self._skin_color_vars.items()
+            if var.get().strip()
+        }
+        self.settings.skin_name = "自定义"
+        self.settings.skin_colors = colors
+        self.settings.save()
+        self._rebuild_ui()
+
+    def _reset_skin(self) -> None:
+        self.settings.skin_name = "bit-light"
+        self.settings.skin_colors = {}
+        self.settings.theme_mode = "light"
+        self.settings.background_image = ""
+        self.settings.save()
+        self._rebuild_ui()
 
     def _build_template_editor(self) -> None:
         self.template_tab.grid_columnconfigure(0, weight=1)
@@ -1494,12 +1848,44 @@ class App(tk.Tk):
             fg=GREEN,
             font=("Microsoft YaHei UI", 8, "bold"),
         ).pack(side="left", padx=14)
+        self.active_template_name_label = tk.Label(
+            header,
+            text="",
+            bg=GREEN,
+            fg="#FFFFFF",
+            padx=12,
+            pady=4,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.active_template_name_label.pack(side="right")
+        self._update_active_template_label()
 
-        card = self._card(self.template_tab, row=1, column=0, sticky="nsew", padx=24, pady=(0, 18))
+        card_canvas = tk.Canvas(self.template_tab, bg=PANEL, highlightthickness=0, bd=0)
+        card_scroll = ttk.Scrollbar(
+            self.template_tab, orient="vertical", command=card_canvas.yview
+        )
+        card_canvas.configure(yscrollcommand=card_scroll.set)
+        card_canvas.grid(row=1, column=0, sticky="nsew", padx=(24, 0), pady=(0, 18))
+        card_scroll.grid(row=1, column=1, sticky="ns", pady=(0, 18))
+        card_holder = tk.Frame(card_canvas, bg=PANEL)
+        card_holder.grid_columnconfigure(0, weight=1)
+        card_window = card_canvas.create_window((0, 0), window=card_holder, anchor="nw")
+
+        self._enable_canvas_wheel(card_canvas, card_holder)
+        card_holder.bind(
+            "<Configure>",
+            lambda _event: card_canvas.configure(scrollregion=card_canvas.bbox("all")),
+        )
+        card_canvas.bind(
+            "<Configure>",
+            lambda event: card_canvas.itemconfigure(card_window, width=event.width),
+        )
+
+        card = self._card(card_holder, row=0, column=0, sticky="nsew")
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(5, weight=1)
 
-        self.variable_guide = tk.Frame(card, bg="#EEE8DA", highlightthickness=1, highlightbackground=LINE)
+        self.variable_guide = tk.Frame(card, bg="#EAF1FF", highlightthickness=1, highlightbackground=LINE)
         self.variable_guide.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 14))
         self._render_system_variables()
 
@@ -1554,20 +1940,47 @@ class App(tk.Tk):
         ).pack(side="left", padx=3)
         ttk.Button(
             library,
+            text=tr("设为当前生效"),
+            style="Primary.TButton",
+            command=self.activate_selected_template,
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            library,
             text=tr("删除模板"),
             style="Soft.TButton",
             command=self.delete_template_from_library,
         ).pack(side="left", padx=3)
+        tk.Label(
+            custom_guide,
+            text=tr("模板库仅保存，不会自动生效；未绑定窗口的任务使用“当前生效模板”"),
+            bg=PAPER,
+            fg=MUTED,
+            font=("Microsoft YaHei UI", 8),
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
         self._refresh_template_library()
 
         tk.Label(card, text=tr("邮件主题"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9, "bold")).grid(row=2, column=0, sticky="w", padx=18, pady=(0, 5))
         self.subject_template_var = tk.StringVar(value=self.settings.subject_template)
         ttk.Entry(card, textvariable=self.subject_template_var, style="App.TEntry").grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
-        tk.Label(card, text=tr("邮件正文"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 9, "bold")).grid(row=4, column=0, sticky="w", padx=18, pady=(0, 5))
+        body_header = tk.Frame(card, bg=PAPER)
+        body_header.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 5))
+        tk.Label(
+            body_header,
+            text=tr("邮件正文"),
+            bg=PAPER,
+            fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            body_header,
+            text=tr("放大编辑"),
+            style="Soft.TButton",
+            command=self.open_large_body_editor,
+        ).pack(side="right")
         self.body_template_text = tk.Text(
             card,
             wrap="word",
-            bg="#FBF8F5",
+            bg="#FFFFFF",
             fg=INK,
             relief="flat",
             highlightthickness=1,
@@ -1579,8 +1992,43 @@ class App(tk.Tk):
         )
         self.body_template_text.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self.body_template_text.insert("1.0", self.settings.body_template)
+        tk.Label(
+            card,
+            text=tr("发件人名字"),
+            bg=PAPER,
+            fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).grid(row=6, column=0, sticky="w", padx=18, pady=(0, 5))
+        self.sender_var = getattr(self, "sender_var", None) or tk.StringVar(
+            value=self.settings.sender_name
+        )
+        ttk.Entry(
+            card, textvariable=self.sender_var, style="App.TEntry",
+        ).grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 12))
+        tk.Label(
+            card,
+            text=tr("发件人签名"),
+            bg=PAPER,
+            fg=INK,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).grid(row=8, column=0, sticky="w", padx=18, pady=(0, 5))
+        self.signature_text = tk.Text(
+            card,
+            wrap="word",
+            height=3,
+            bg="#FFFFFF",
+            fg=INK,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=LINE,
+            padx=12,
+            pady=10,
+            font=("Segoe UI", 10),
+        )
+        self.signature_text.grid(row=9, column=0, sticky="ew", padx=18, pady=(0, 12))
+        self.signature_text.insert("1.0", self.settings.signature)
         footer = tk.Frame(card, bg=PAPER)
-        footer.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 16))
+        footer.grid(row=10, column=0, sticky="ew", padx=18, pady=(0, 16))
         ttk.Button(footer, text=tr("恢复默认模板"), style="Soft.TButton", command=self.reset_email_template).pack(side="left")
         ttk.Button(footer, text=tr("复制主题"), style="Soft.TButton", command=self.copy_template_subject).pack(side="left", padx=(8, 0))
         ttk.Button(footer, text=tr("复制正文"), style="Soft.TButton", command=self.copy_template_body).pack(side="left", padx=(8, 0))
@@ -1591,12 +2039,12 @@ class App(tk.Tk):
     def _render_system_variables(self) -> None:
         for child in self.variable_guide.winfo_children():
             child.destroy()
-        header = tk.Frame(self.variable_guide, bg="#EEE8DA")
+        header = tk.Frame(self.variable_guide, bg="#EAF1FF")
         header.grid(row=0, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 0))
         tk.Label(
             header,
             text=tr("系统变量 · 不需要可隐藏，模板中仍可正常引用"),
-            bg="#EEE8DA",
+            bg="#EAF1FF",
             fg=MUTED,
             font=("Microsoft YaHei UI", 8),
         ).pack(side="left")
@@ -1627,20 +2075,20 @@ class App(tk.Tk):
         ]
         for column, (key, description) in enumerate(visible):
             self.variable_guide.grid_columnconfigure(column, weight=1)
-            item = tk.Frame(self.variable_guide, bg="#EEE8DA")
+            item = tk.Frame(self.variable_guide, bg="#EAF1FF")
             item.grid(row=1, column=column, sticky="nsew", padx=10, pady=10)
             token = f"{{{key}}}"
             tk.Label(
                 item,
                 text=token,
-                bg="#EEE8DA",
+                bg="#EAF1FF",
                 fg=GREEN,
                 font=("Segoe UI", 10, "bold"),
             ).pack(anchor="w")
             tk.Label(
                 item,
                 text=description,
-                bg="#EEE8DA",
+                bg="#EAF1FF",
                 fg=MUTED,
                 font=("Microsoft YaHei UI", 8),
             ).pack(anchor="w", pady=(2, 6))
@@ -1709,7 +2157,7 @@ class App(tk.Tk):
         for index, key in enumerate(keys):
             item = tk.Frame(
                 self.custom_variables_frame,
-                bg="#FBF8F5",
+                bg="#FFFFFF",
                 highlightthickness=1,
                 highlightbackground=LINE,
             )
@@ -1718,7 +2166,7 @@ class App(tk.Tk):
             tk.Label(
                 item,
                 text=f"{{{key}}}",
-                bg="#FBF8F5",
+                bg="#FFFFFF",
                 fg=GREEN,
                 font=("Segoe UI", 9, "bold"),
                 width=14,
@@ -1782,6 +2230,50 @@ class App(tk.Tk):
         self._render_manual_custom_fields()
         self._set_status(f"变量 {key} 已{'上移' if direction < 0 else '下移'}")
 
+    def _update_active_template_label(self) -> None:
+        if not hasattr(self, "active_template_name_label"):
+            return
+        name = str(getattr(self.settings, "active_template_name", "") or "").strip()
+        if name:
+            text = trf("当前生效：{name}", name=name)
+        else:
+            text = tr("当前生效：自定义模板（未命名）")
+        self.active_template_name_label.configure(text=text)
+
+    def activate_selected_template(self) -> None:
+        name = self.template_library_var.get()
+        template = next(
+            (
+                item
+                for item in self.settings.saved_templates
+                if item.get("name") == name
+            ),
+            None,
+        )
+        if not template:
+            messagebox.showwarning(
+                "设为当前生效",
+                "请先选择模板库中已保存的模板。",
+            )
+            return
+        self.subject_template_var.set(template.get("subject_template", ""))
+        self.body_template_text.delete("1.0", "end")
+        self.body_template_text.insert("1.0", template.get("body_template", ""))
+        self.sender_var.set(template.get("sender_name", self.settings.sender_name))
+        self.signature_text.delete("1.0", "end")
+        self.signature_text.insert("1.0", template.get("signature", ""))
+        stored = template.get("custom_variables") or {}
+        for key, var in self.custom_template_vars.items():
+            var.set(str(stored.get(key, "")))
+        self.save_email_template()
+        self.settings.active_template_name = str(name)
+        try:
+            self.settings.save()
+        except Exception:
+            pass
+        self._update_active_template_label()
+        self._set_status(trf("模板“{name}”已设为当前生效", name=name))
+
     def _refresh_template_library(self) -> None:
         if not hasattr(self, "template_library_combo"):
             return
@@ -1806,6 +2298,8 @@ class App(tk.Tk):
             "subject_template": self.subject_template_var.get().strip(),
             "body_template": self.body_template_text.get("1.0", "end-1c").strip(),
             "custom_variables": self._current_custom_variables(),
+            "sender_name": self.sender_var.get().strip(),
+            "signature": self.signature_text.get("1.0", "end-1c").strip(),
         }
         existing = [
             template
@@ -1823,6 +2317,7 @@ class App(tk.Tk):
             messagebox.showerror("模板保存失败", str(exc))
             return
         self._refresh_template_library()
+        self._refresh_window_template_options()
         self._set_status(f"模板“{entry['name']}”已保存")
 
     def load_template_from_library(self) -> None:
@@ -1841,10 +2336,15 @@ class App(tk.Tk):
         self.subject_template_var.set(template.get("subject_template", ""))
         self.body_template_text.delete("1.0", "end")
         self.body_template_text.insert("1.0", template.get("body_template", ""))
+        self.sender_var.set(template.get("sender_name", self.settings.sender_name))
+        self.signature_text.delete("1.0", "end")
+        self.signature_text.insert("1.0", template.get("signature", ""))
         stored = template.get("custom_variables") or {}
         for key, var in self.custom_template_vars.items():
             var.set(str(stored.get(key, "")))
-        self._set_status(f"已加载模板“{name}”，点击“保存邮件模板”后生效")
+        self._set_status(
+            f"已加载模板“{name}”到编辑区；点击“设为当前生效”或“保存邮件模板”后生效"
+        )
 
     def delete_template_from_library(self) -> None:
         name = self.template_library_var.get()
@@ -1869,6 +2369,7 @@ class App(tk.Tk):
             messagebox.showerror("删除模板失败", str(exc))
             return
         self._refresh_template_library()
+        self._refresh_window_template_options()
         self._set_status(f"模板“{name}”已删除")
 
     def add_custom_template_variable(self) -> None:
@@ -1915,6 +2416,46 @@ class App(tk.Tk):
 
     def _current_template_values(self) -> tuple[str, str]:
         return self.subject_template_var.get().strip(), self.body_template_text.get("1.0", "end-1c").strip()
+
+    def open_large_body_editor(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(tr("放大编辑邮件正文"))
+        dialog.geometry("860x620")
+        dialog.configure(bg=PAPER)
+        text = tk.Text(
+            dialog,
+            wrap="word",
+            bg="#FFFFFF",
+            fg=INK,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=LINE,
+            padx=16,
+            pady=16,
+            font=("Segoe UI", 12),
+            spacing1=3,
+            spacing3=6,
+            undo=True,
+        )
+        text.pack(fill="both", expand=True, padx=14, pady=(14, 8))
+        text.insert("1.0", self.body_template_text.get("1.0", "end-1c"))
+        text.focus_set()
+
+        buttons = tk.Frame(dialog, bg=PAPER)
+        buttons.pack(fill="x", padx=14, pady=(0, 14))
+
+        def save() -> None:
+            self.body_template_text.delete("1.0", "end")
+            self.body_template_text.insert("1.0", text.get("1.0", "end-1c"))
+            dialog.destroy()
+            self._set_status(tr("正文已更新，点击“保存邮件模板”后生效"))
+
+        ttk.Button(buttons, text=tr("保存"), style="Primary.TButton", command=save).pack(side="right")
+        ttk.Button(buttons, text=tr("取消"), style="Soft.TButton", command=dialog.destroy).pack(side="right", padx=(0, 8))
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.wait_window()
 
     def _current_custom_variables(self) -> dict[str, str]:
         return {key: variable.get() for key, variable in self.custom_template_vars.items()}
@@ -1990,7 +2531,10 @@ class App(tk.Tk):
             return
         self.settings.subject_template = subject_template
         self.settings.body_template = body_template
+        self.settings.sender_name = self.sender_var.get().strip()
+        self.settings.signature = self.signature_text.get("1.0", "end-1c").strip()
         self.settings.custom_variables = self._current_custom_variables()
+        self.settings.active_template_name = ""
         missing_keys = sorted(
             {
                 match.group(1)
@@ -2021,6 +2565,7 @@ class App(tk.Tk):
             else ""
         )
         self._set_status("邮件模板已保存" + suffix)
+        self._update_active_template_label()
 
     def reset_email_template(self) -> None:
         if not messagebox.askyesno(
@@ -2121,42 +2666,6 @@ class App(tk.Tk):
                 value_var.set("")
         self._set_status("已清空联系人输入")
 
-    def import_contacts_csv(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.askopenfilename(
-            title="选择联系人 CSV",
-            filetypes=[("CSV 文件", "*.csv")],
-        )
-        if not path:
-            return
-        try:
-            entries = parse_contacts_csv(path)
-        except Exception as exc:
-            messagebox.showerror("导入 CSV 失败", str(exc))
-            return
-        if not entries:
-            messagebox.showwarning("导入 CSV", "CSV 文件中没有数据。")
-            return
-        if len(entries) > MAX_CONTACT_ROWS:
-            messagebox.showwarning(
-                "导入 CSV",
-                f"CSV 共 {len(entries)} 行，只导入前 {MAX_CONTACT_ROWS} 行。",
-            )
-            entries = entries[:MAX_CONTACT_ROWS]
-        self._ensure_contact_rows(len(entries))
-
-        filled = 0
-        for index, entry in enumerate(entries):
-            name_var, location_var, email_var, custom_vars = self.contact_rows[index]
-            name_var.set(entry["name"])
-            location_var.set(entry["location"])
-            email_var.set(entry["email"])
-            for key, var in custom_vars.items():
-                var.set(entry.get(key, entry.get(key.replace("custom_", "变量"), "")))
-            filled += 1
-        self._set_status(f"CSV 已导入 {filled} 行，请核对后加入队列")
-
     def import_contacts_xlsx(self) -> None:
         from tkinter import filedialog
 
@@ -2181,7 +2690,8 @@ class App(tk.Tk):
                 f"文件共 {len(entries)} 行，只导入前 {MAX_CONTACT_ROWS} 行。",
             )
             entries = entries[:MAX_CONTACT_ROWS]
-        if not self._confirm_xlsx_entries(entries):
+        entries = self._confirm_xlsx_entries(entries)
+        if entries is None:
             return
         self._ensure_contact_rows(len(entries))
 
@@ -2196,7 +2706,7 @@ class App(tk.Tk):
             filled += 1
         self._set_status(f"XLSX 已导入 {filled} 行（模板示例行已跳过），请核对后加入队列")
 
-    def _confirm_xlsx_entries(self, entries: list[dict[str, str]]) -> bool:
+    def _confirm_xlsx_entries(self, entries: list[dict[str, str]]) -> list[dict[str, str]] | None:
         try:
             existing_rows = self.db.list_tasks()
         except Exception:
@@ -2223,7 +2733,7 @@ class App(tk.Tk):
             seen.add(email.casefold())
             flagged.append((entry, "、".join(problems)))
 
-        result: dict[str, bool] = {"confirmed": False}
+        result: dict[str, object] = {"entries": None}
         dialog = tk.Toplevel(self)
         dialog.title("XLSX 导入预览")
         dialog.geometry("760x520")
@@ -2278,18 +2788,26 @@ class App(tk.Tk):
         buttons.pack(fill="x", padx=14, pady=(4, 14))
 
         def confirm() -> None:
-            if problem_count and not messagebox.askyesno(
-                "仍有问题行",
-                f"仍有 {problem_count} 行存在重复/缺字段/已存在，仍然导入吗？",
-                icon=messagebox.WARNING,
-                default=messagebox.NO,
-            ):
-                return
-            result["confirmed"] = True
+            if problem_count:
+                choice = messagebox.askyesnocancel(
+                    "仍有问题行",
+                    "是：跳过问题行导入\n否：全部导入\n取消：不导入",
+                    icon=messagebox.WARNING,
+                    default=messagebox.NO,
+                )
+                if choice is None:
+                    return
+                result["entries"] = (
+                    [entry for entry, problems in flagged if not problems]
+                    if choice
+                    else entries
+                )
+            else:
+                result["entries"] = entries
             dialog.destroy()
 
         def cancel() -> None:
-            result["confirmed"] = False
+            result["entries"] = None
             dialog.destroy()
 
         ttk.Button(buttons, text="确认导入", style="Primary.TButton", command=confirm).pack(side="right")
@@ -2297,41 +2815,7 @@ class App(tk.Tk):
         dialog.bind("<Escape>", lambda _event: cancel())
         dialog.grab_set()
         dialog.wait_window()
-        return result["confirmed"]
-
-    def download_csv_template(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.asksaveasfilename(
-            title="保存联系人 CSV 模板",
-            defaultextension=".csv",
-            initialfile="联系人导入模板.csv",
-            filetypes=[("CSV 文件", "*.csv")],
-        )
-        if not path:
-            return
-        headers = ["名字", "地区", "邮箱"] + [
-            f"变量{index}" for index in range(1, 6)
-        ]
-        rows = [
-            headers,
-            ["张三", "Seattle", "zhangsan@example.com", "酒店推荐", "美食", "安全", "", ""],
-            ["李四", "Boston", "lisi@example.com", "", "", "", "", ""],
-        ]
-        try:
-            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerows(rows)
-        except Exception as exc:
-            self._set_status(f"模板保存失败：{exc}")
-            messagebox.showerror("模板保存失败", str(exc))
-            return
-        self._set_status(f"CSV 模板已保存：{path}")
-        messagebox.showinfo(
-            "CSV 模板",
-            f"模板已保存到：\n{path}\n\n"
-            "填好后点击“导入 CSV”即可，最多支持 100 行。",
-        )
+        return result["entries"]
 
     def download_xlsx_template(self) -> None:
         from tkinter import filedialog
@@ -2405,14 +2889,16 @@ class App(tk.Tk):
         try:
             task_id = self._add_contact_row(row_index)
         except Exception as exc:
-            messagebox.showerror("无法生成邮件", str(exc))
+            self._show_generation_error("无法生成邮件", exc)
             return
+        self._bind_profiles_at_generation([task_id])
         self.refresh()
         self._select_page(self.queue_tab)
         self._background_task(
             lambda cancel_event: self.workflow.generate_local(task_id, cancel_event=cancel_event),
             f"正在本地生成第 {row_index + 1} 行邮件",
             on_success=lambda: self._select_task_by_id(task_id),
+            on_error=lambda exc: self._show_generation_error("邮件生成失败", exc),
         )
 
     def generate_all_contacts(self) -> None:
@@ -2461,6 +2947,7 @@ class App(tk.Tk):
         if not task_ids:
             messagebox.showwarning("没有可处理资料", "请填写至少一组有效的名字、地区和邮箱地址。")
             return
+        self._bind_profiles_at_generation([task_id for _row_number, task_id in task_ids])
         self.refresh()
         self._select_page(self.queue_tab)
 
@@ -2486,7 +2973,11 @@ class App(tk.Tk):
                     break
                 except Exception as exc:
                     runtime_failures.append(f"第 {row_number} 行：{exc}")
-                    logger.warning("第 %s 行生成失败：%s", row_number, exc)
+                    logger.exception("第 %s 行生成失败", row_number)
+                    try:
+                        self.db.update_task(task_id, last_error=str(exc))
+                    except Exception:
+                        pass
                 elapsed = time.monotonic() - started_at
                 average = elapsed / index
                 remaining = average * (total - index)
@@ -2515,10 +3006,14 @@ class App(tk.Tk):
                 )
                 if failures:
                     details = "\n".join(failures[:MAX_CONCURRENT_TASKS])
+                    hint = self._generation_fix_hint_text(
+                        runtime_failures[0] if runtime_failures else ""
+                    )
                     messagebox.showwarning(
                         "批量生成完成",
                         f"成功：{succeeded}\n跳过：{len(failures)}\n"
-                        f"取消：{cancelled}\n用时：{elapsed} 秒\n\n{details}",
+                        f"取消：{cancelled}\n用时：{elapsed} 秒\n\n{details}\n\n"
+                        f"解决方案：{hint}",
                     )
                 else:
                     self._set_status(f"已成功生成 {succeeded} 封邮件，用时 {elapsed} 秒")
@@ -2531,6 +3026,61 @@ class App(tk.Tk):
     def _current_window_sequence(self) -> list[int]:
         return normalize_window_sequence([var.get() for var in self.window_sequence_vars])
 
+    def _bind_profiles_at_generation(self, task_ids: list[int]) -> dict[int, int]:
+        """Assign windows at generation time so window templates render first."""
+        if not task_ids:
+            return {}
+        try:
+            sequence = self._current_window_sequence()
+        except ValueError as exc:
+            self._set_status(f"窗口顺序无效：{exc}")
+            return {}
+        if not sequence:
+            self._set_status("未设置窗口顺序，生成将使用当前生效模板")
+            return {}
+        rows = self.db.get_tasks(task_ids)
+        existing = [int(row["profile_no"] or 0) for row in rows]
+        pending = self.db.pending_counts_by_window()
+        resolved = resolve_task_windows_balanced(existing, sequence, pending)
+        assigned: dict[int, int] = {}
+        for task_id, profile_no in zip(task_ids, resolved):
+            if profile_no is None or int(profile_no) <= 0:
+                continue
+            try:
+                self.db.update_task(task_id, profile_no=int(profile_no))
+            except ValueError:
+                continue
+            assigned[int(task_id)] = int(profile_no)
+        return assigned
+
+    def _regenerate_pending_for_windows(self, profile_numbers: list[int]) -> None:
+        """Regenerate unsent tasks after their window template binding changes."""
+        rows = self.db.pending_tasks_by_profiles(profile_numbers)
+        if not rows:
+            return
+        succeeded = 0
+        failures: list[str] = []
+        for row in rows:
+            try:
+                self.workflow.generate_local(int(row["id"]))
+                succeeded += 1
+            except Exception as exc:
+                failures.append(f"任务 {row['id']}：{exc}")
+        self.refresh()
+        if failures:
+            self._set_status(
+                f"已按窗口模板重新生成 {succeeded} 封，失败 {len(failures)} 封"
+            )
+            messagebox.showwarning(
+                "模板同步未完成",
+                "部分任务重新生成失败：\n"
+                + "\n".join(failures[:MAX_CONCURRENT_TASKS]),
+            )
+        else:
+            self._set_status(
+                f"已按窗口模板重新生成 {succeeded} 封待发送邮件"
+            )
+
     def save_window_sequence(self) -> None:
         if not self._require_authorization():
             return
@@ -2539,12 +3089,37 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("窗口顺序无效", str(exc))
             return
+        old_bindings = dict(self.settings.window_bindings or {})
         self.settings.window_sequence = sequence
+        bindings: dict[str, dict] = {}
+        template_vars = getattr(self, "_window_template_vars", [])
+        sender_vars = getattr(self, "_window_sender_vars", [])
+        for index, number in enumerate(sequence):
+            template_name = (
+                template_vars[index].get() if index < len(template_vars) else ""
+            )
+            sender = (
+                sender_vars[index].get().strip()
+                if index < len(sender_vars)
+                else ""
+            )
+            bindings[str(number)] = {
+                "template_name": template_name,
+                "sender_name": sender,
+            }
+        self.settings.window_bindings = bindings
         self.settings.save()
         self.window_sequence_vars = [tk.StringVar(value=str(value)) for value in sequence]
         self._render_window_sequence_rows()
         self.window_sequence_note_var.set(f"已设置 {len(sequence)} 个窗口")
         self._set_status(f"已保存 {len(sequence)} 个浏览器窗口编号")
+        changed = [
+            number
+            for number in sequence
+            if old_bindings.get(str(number)) != bindings.get(str(number))
+        ]
+        if changed:
+            self._regenerate_pending_for_windows(changed)
 
     def clear_window_sequence(self) -> None:
         if not self.window_sequence_vars:
@@ -2620,9 +3195,16 @@ class App(tk.Tk):
         if runnable_count == 0:
             messagebox.showwarning("没有可执行任务", "\n".join(initial_failures[:MAX_CONCURRENT_TASKS]))
             return
-        estimate_seconds = (
-            runnable_count * 12
-            + max(0, runnable_count - 1) * BATCH_DRAFT_INTERVAL_SECONDS
+        estimate_seconds = runnable_count * 8
+
+        # Follow the Window Order page: same-window tasks stay grouped and
+        # windows run in the order configured there.
+        rank = {int(profile_no): index for index, profile_no in enumerate(sequence)}
+        runnable_tasks.sort(
+            key=lambda pair: (
+                rank.get(int(pair[1]), len(sequence) + int(pair[1])),
+                pair[0],
+            )
         )
 
         for task_id, profile_no in runnable_tasks:
@@ -2645,7 +3227,7 @@ class App(tk.Tk):
 
         def process_task(task_id: int, profile_no: int) -> None:
             # Tasks aimed at the same browser must never edit one compose box
-            # concurrently. Different windows can overlap after their staggered start.
+            # concurrently; different windows run in parallel.
             with profile_locks[profile_no]:
                 if wait_send:
                     self.workflow.open_draft_wait_send(
@@ -2682,8 +3264,6 @@ class App(tk.Tk):
                         continue
                     future = executor.submit(process_task, task_id, profile_no)
                     futures[future] = (task_id, profile_no)
-                    if index < runnable_count - 1 and cancel_event.wait(BATCH_DRAFT_INTERVAL_SECONDS):
-                        break
                 for future in as_completed(futures):
                     processed += 1
                     task_id, profile_no = futures[future]
@@ -2698,11 +3278,10 @@ class App(tk.Tk):
                         profile_failures[profile_no] = (
                             profile_failures.get(profile_no, 0) + 1
                         )
-                        logger.warning(
-                            "窗口 %s / 任务 %s 填写失败：%s",
+                        logger.exception(
+                            "窗口 %s / 任务 %s 填写失败",
                             profile_no,
                             task_id,
-                            exc,
                         )
                     elapsed = time.monotonic() - started_at
                     average = elapsed / processed
@@ -2969,6 +3548,7 @@ class App(tk.Tk):
             )
             return
         task_ids = [int(self.tree.item(item, "values")[0]) for item in selected]
+        self._bind_profiles_at_generation(task_ids)
 
         cancel_event, operation_serial = self.operations.begin()
         self._set_operation_busy(True)
@@ -2995,7 +3575,11 @@ class App(tk.Tk):
                     break
                 except Exception as exc:
                     runtime_failures.append(f"任务 {task_id}：{exc}")
-                    logger.warning("任务 %s 生成失败：%s", task_id, exc)
+                    logger.exception("任务 %s 生成失败", task_id)
+                    try:
+                        self.db.update_task(task_id, last_error=str(exc))
+                    except Exception:
+                        pass
                 elapsed = time.monotonic() - started_at
                 average = elapsed / index
                 remaining = average * (total - index)
@@ -3027,10 +3611,14 @@ class App(tk.Tk):
                         f"成功：{succeeded}\n跳过：{len(failures)}\n"
                         f"取消：{cancelled}\n用时：{elapsed} 秒"
                     )
+                    hint = self._generation_fix_hint_text(
+                        runtime_failures[0] if runtime_failures else ""
+                    )
                     messagebox.showwarning(
                         "所选邮件生成完成",
                         summary + "\n\n"
-                        + "\n".join(failures[:MAX_CONCURRENT_TASKS]),
+                        + "\n".join(failures[:MAX_CONCURRENT_TASKS])
+                        + f"\n\n解决方案：{hint}",
                     )
                 else:
                     self._set_status(f"已成功生成全部 {succeeded} 封邮件，用时 {elapsed} 秒")
@@ -3074,6 +3662,37 @@ class App(tk.Tk):
         self.preview.configure(state="disabled")
         self._set_status(f"已标记 {updated} 条任务为已发送，已移出工作台")
 
+    def unmark_selected_sent(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择任务", "请先选择已标记为已发送的任务。")
+            return
+        task_ids = [int(self.tree.item(item, "values")[0]) for item in selected]
+        rows = self.db.get_tasks(task_ids)
+        sent_ids = [
+            int(row["id"])
+            for row in rows
+            if row["status"] in {"sent", "replied"}
+        ]
+        if not sent_ids:
+            self._set_status("所选任务不是已发送状态，无需撤销")
+            return
+        if not messagebox.askyesno(
+            "撤销标记",
+            f"确定把选中的 {len(sent_ids)} 条任务恢复为 Gmail 草稿吗？",
+            icon=messagebox.WARNING,
+            default=messagebox.NO,
+        ):
+            return
+        try:
+            updated = self.db.unmark_sent(sent_ids)
+        except Exception as exc:
+            self._set_status(f"撤销失败：{exc}")
+            messagebox.showerror("撤销失败", str(exc))
+            return
+        self.refresh()
+        self._set_status(f"已撤销 {updated} 条任务的已发送标记")
+
     def delete_selected_queue_tasks(self) -> None:
         selected = self.tree.selection()
         if not selected:
@@ -3114,6 +3733,8 @@ class App(tk.Tk):
         self.preview.configure(state="disabled")
         self.manual_name_var.set("")
         self.manual_location_var.set("")
+        if hasattr(self, "manual_sender_var"):
+            self.manual_sender_var.set("")
         self.profile_assign_note_var.set("请选择任务")
         self._set_status(f"已删除 {len(task_ids)} 条人物/草稿记录")
 
@@ -3141,27 +3762,56 @@ class App(tk.Tk):
         except ValueError:
             pass
 
-    def refresh_window_picker(self) -> None:
+    def _fetch_windows_async(self, quiet: bool = False) -> None:
+        serial = getattr(self, "_picker_fetch_serial", 0) + 1
+        self._picker_fetch_serial = serial
         provider = create_browser_provider(self.settings)
-        try:
-            windows = provider.list_windows()
-        except Exception as exc:
-            self._set_status(f"识别窗口失败：{exc}")
-            messagebox.showerror("识别窗口失败", str(exc))
+
+        def runner() -> None:
+            try:
+                windows = provider.list_windows()
+            except Exception as exc:
+                logger.warning("识别窗口失败：%s", exc, exc_info=True)
+                def fail() -> None:
+                    if self._picker_fetch_serial != serial:
+                        return
+                    if not quiet:
+                        self._set_status(f"识别窗口失败：{exc}")
+                        messagebox.showerror("识别窗口失败", str(exc))
+
+                self.after(0, fail)
+                return
+
+            def finish() -> None:
+                if self._picker_fetch_serial != serial:
+                    return
+                if not windows:
+                    if not quiet:
+                        self._set_status("未识别到浏览器窗口，请确认浏览器应用已启动")
+                        messagebox.showwarning(
+                            tr("自动识别窗口"),
+                            tr("未识别到浏览器窗口，请确认浏览器应用已启动"),
+                        )
+                    return
+                labels = [
+                    f"{number} · {name}" if name else number
+                    for number, name in windows
+                ]
+                self.window_picker_combo["values"] = labels
+                suffix = "" if quiet else "，可直接在下拉中选择"
+                self._set_status(f"已识别 {len(windows)} 个浏览器窗口{suffix}")
+
+            self.after(0, finish)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def auto_populate_picker_quiet(self) -> None:
+        if self.window_picker_combo["values"]:
             return
-        if not windows:
-            self._set_status("未识别到浏览器窗口，请确认浏览器应用已启动")
-            messagebox.showwarning(
-                tr("自动识别窗口"),
-                tr("未识别到浏览器窗口，请确认浏览器应用已启动"),
-            )
-            return
-        labels = [
-            f"{number} · {name}" if name else number
-            for number, name in windows
-        ]
-        self.window_picker_combo["values"] = labels
-        self._set_status(f"已识别 {len(windows)} 个浏览器窗口，可直接在下拉中选择")
+        self._fetch_windows_async(quiet=True)
+
+    def refresh_window_picker(self) -> None:
+        self._fetch_windows_async(quiet=False)
 
     def assign_profile_to_selected(self) -> None:
         if not self._require_authorization():
@@ -3196,9 +3846,23 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("无法保存窗口", str(exc))
             return
+        try:
+            self.workflow.generate_local(task_id)
+        except Exception as exc:
+            self._set_status(
+                f"任务 {task_id} 已锁定窗口 {profile_no}，但按窗口模板重新生成失败"
+            )
+            messagebox.showwarning(
+                "内容未刷新",
+                f"任务 {task_id} 已锁定窗口 {profile_no}，"
+                f"但按窗口模板重新生成失败：\n{exc}",
+            )
+        else:
+            self._set_status(
+                f"任务 {task_id} 已锁定窗口 {profile_no}，并按窗口模板重新生成"
+            )
         self.refresh()
         self.show_preview()
-        self._set_status(f"任务 {task_id} 已锁定浏览器窗口 {profile_no}")
 
     def _handle_task_table_click(self, event) -> None:
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -3287,10 +3951,24 @@ class App(tk.Tk):
             except Exception as exc:
                 self._set_status(f"无法保存窗口：{exc}")
                 return
+            try:
+                self.workflow.generate_local(task_id)
+            except Exception as exc:
+                self._set_status(
+                    f"任务 {task_id} 已锁定窗口 {profile_no}，但按窗口模板重新生成失败"
+                )
+                messagebox.showwarning(
+                    "内容未刷新",
+                    f"任务 {task_id} 已锁定窗口 {profile_no}，"
+                    f"但按窗口模板重新生成失败：\n{exc}",
+                )
+            else:
+                self._set_status(
+                    f"任务 {task_id} 已锁定窗口 {profile_no}，并按窗口模板重新生成"
+                )
             self.refresh()
             self._select_task_by_id(task_id)
             self.show_preview()
-            self._set_status(f"任务 {task_id} 已锁定浏览器窗口 {profile_no}")
 
         editor.bind("<Return>", lambda _event: finish(True))
         editor.bind("<Escape>", lambda _event: finish(False))
@@ -3381,6 +4059,7 @@ class App(tk.Tk):
                 task_id,
                 self.manual_name_var.get(),
                 self.manual_location_var.get(),
+                self.manual_sender_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("无法保存资料", str(exc))
@@ -3501,6 +4180,8 @@ class App(tk.Tk):
         )
         self.manual_name_var.set(effective_name)
         self.manual_location_var.set(row["location_override"] or row["location"])
+        if hasattr(self, "manual_sender_var"):
+            self.manual_sender_var.set(row["sender_name_override"] or "")
         if hasattr(self, "manual_custom_vars"):
             task_custom: dict[str, str] = {}
             raw_custom = row["custom_variables"] or ""
@@ -3520,8 +4201,9 @@ class App(tk.Tk):
                         key, self.settings.custom_variables.get(key, "")
                     )
                 )
-        if row["subject"] and row["body"]:
-            text = f"Subject: {row['subject']}\n\n{row['body']}"
+        preview_subject, preview_body = row["subject"], row["body"]
+        if preview_subject and preview_body:
+            text = f"Subject: {preview_subject}\n\n{preview_body}"
         else:
             text = "尚未生成邮件。请检查名字和地区，然后点击“本地生成所选”。"
         self.preview.configure(state="normal")
@@ -3653,9 +4335,36 @@ class App(tk.Tk):
             return
         self.refresh()
         self._set_status(f"已从备份恢复：{path}")
-        messagebox.showinfo("恢复备份", "已从备份恢复，数据已刷新。")
+        messagebox.showinfo(
+            "恢复备份",
+            "已从备份恢复。为避免数据不一致，请重启软件后继续操作。",
+        )
 
-    def _background_task(self, action, label: str, on_success=None) -> None:
+    @staticmethod
+    def _generation_fix_hint_text(text: str) -> str:
+        if "请填写联系人名字" in text or "名字为空" in text:
+            return "请在录入页填写「名字」；若名字已隐藏，可在模板页恢复该变量。"
+        if "城市" in text or "地区" in text:
+            return "请填写有效的城市或地区（至少 2 个字符，不能是纯数字）。"
+        if "占位符" in text:
+            return "模板里有无效变量，请到「邮件模板」页只使用标注的变量（{first_name}、{location}、{sender_name}、{custom_1} 等）。"
+        if "为空" in text:
+            return "请检查模板的主题/正文是否为空，并确认已保存并设为当前生效模板。"
+        if "Row" in text and "get" in text:
+            return "数据读取异常，请升级到最新版本后重新生成。"
+        return "请检查：名字/地区是否填写、模板是否设为当前生效、变量是否有效；仍失败请把这条提示发给管理员。"
+
+    @classmethod
+    def _generation_fix_hint(cls, exc: Exception) -> str:
+        return cls._generation_fix_hint_text(str(exc))
+
+    def _show_generation_error(self, title: str, exc: Exception) -> None:
+        messagebox.showerror(
+            title,
+            f"{exc}\n\n解决方案：{self._generation_fix_hint(exc)}",
+        )
+
+    def _background_task(self, action, label: str, on_success=None, on_error=None) -> None:
         cancel_event, operation_serial = self.operations.begin()
         self._set_operation_busy(True)
 
@@ -3666,15 +4375,18 @@ class App(tk.Tk):
             except OperationCancelledError:
                 return
             except Exception as exc:
-                logger.warning("后台任务失败：%s", exc)
+                logger.exception("后台任务失败：%s", label)
                 if self.operations.is_current(cancel_event, operation_serial):
-                    self.after(
-                        0,
-                        lambda exc=exc: messagebox.showerror(
-                            "操作失败",
-                            f"{label.replace('正在', '').strip()}失败：{exc}",
-                        ),
-                    )
+                    if on_error is not None:
+                        self.after(0, lambda exc=exc: on_error(exc))
+                    else:
+                        self.after(
+                            0,
+                            lambda exc=exc: messagebox.showerror(
+                                "操作失败",
+                                f"{label.replace('正在', '').strip()}失败：{exc}",
+                            ),
+                        )
                     self.after(
                         0,
                         lambda exc=exc: self._set_status(
@@ -3712,18 +4424,32 @@ class App(tk.Tk):
         return f"约 {minutes} 分钟"
 
     def _set_status(self, text: str, busy: bool = False) -> None:
+        self.status_var._niuma_orig_value = text
         self.status_var.set(tr(text))
         state = tr("处理中…") if busy else tr("本地模式")
         self.connection_var.set(f"{tr(remaining_text(self._trial_status))} · {state}")
 
     def _set_operation_busy(self, busy: bool) -> None:
         self._operation_busy = busy
+        if getattr(self, "_busy_watchdog_job", None):
+            self.after_cancel(self._busy_watchdog_job)
+            self._busy_watchdog_job = None
+        if busy:
+            self._busy_watchdog_job = self.after(
+                45 * 60 * 1000, self._force_busy_reset
+            )
         work_state = "disabled" if busy else "!disabled"
         stop_state = "!disabled" if busy else "disabled"
         for button in getattr(self, "_operation_buttons", []):
             button.state([work_state])
         if hasattr(self, "cancel_operation_button"):
             self.cancel_operation_button.state([stop_state])
+
+    def _force_busy_reset(self) -> None:
+        self._busy_watchdog_job = None
+        logger.warning("检测到任务超过 45 分钟未完成，已自动恢复按钮状态")
+        self._set_operation_busy(False)
+        self._set_status("任务执行异常已自动恢复，可重新操作")
 
     def _apply_authorization_state(self) -> None:
         remaining = remaining_text(self._trial_status)
@@ -3750,7 +4476,7 @@ class App(tk.Tk):
                         "请到“系统设置”输入管理员验证码。"
                     )
                 )
-                self.lock_banner.pack(fill="x", before=self.shell)
+                self.lock_banner.pack(fill="x", side="top", before=self.shell_body)
 
     def _show_authorization_required(self) -> None:
         if hasattr(self, "settings_tab"):
@@ -3876,7 +4602,7 @@ class App(tk.Tk):
         text = tk.Text(
             dialog,
             wrap="word",
-            bg="#FBF8F5",
+            bg="#FFFFFF",
             fg=INK,
             relief="flat",
             padx=10,
@@ -3891,6 +4617,29 @@ class App(tk.Tk):
             lines = ["（暂无日志）"]
         text.insert("1.0", "\n".join(lines[-300:]))
         text.configure(state="disabled")
+
+        def copy_log() -> None:
+            content = text.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            self._set_status("日志已复制，可粘贴给管理员")
+
+        def open_log_folder() -> None:
+            try:
+                os.startfile(str(log_dir))  # type: ignore[attr-defined]
+            except OSError:
+                pass
+
+        log_actions = tk.Frame(dialog, bg=PAPER)
+        log_actions.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(
+            log_actions, text=tr("复制日志"), style="Soft.TButton",
+            command=copy_log,
+        ).pack(side="left")
+        ttk.Button(
+            log_actions, text=tr("打开日志文件夹"), style="Soft.TButton",
+            command=open_log_folder,
+        ).pack(side="left", padx=(8, 0))
         shots_dir = log_dir / "screenshots"
         shots = (
             sorted(shots_dir.glob("*.png"), reverse=True)
@@ -3916,6 +4665,17 @@ class App(tk.Tk):
                 f"当前版本：v{__version__}\n尚未配置更新地址，请等待管理员发布更新。",
             )
             return
+        if silent and self.settings.last_update_check_at:
+            try:
+                last_check = datetime.fromisoformat(
+                    self.settings.last_update_check_at
+                )
+                if (
+                    datetime.now(timezone.utc) - last_check
+                ).total_seconds() < 86400:
+                    return
+            except ValueError:
+                pass
         self._set_status("正在检查更新…", busy=True)
 
         def runner() -> None:
@@ -3932,6 +4692,11 @@ class App(tk.Tk):
                 return
 
             def finish() -> None:
+                try:
+                    self.settings.last_update_check_at = now_iso()
+                    self.settings.save()
+                except Exception:
+                    pass
                 remote_version = str(payload.get("version") or "").strip().lstrip("v")
                 download_url = str(payload.get("url") or "")
                 current_version = str(__version__).lstrip("v")
@@ -4052,6 +4817,9 @@ class App(tk.Tk):
         if self._trial_job:
             self.after_cancel(self._trial_job)
             self._trial_job = None
+        if getattr(self, "_busy_watchdog_job", None):
+            self.after_cancel(self._busy_watchdog_job)
+            self._busy_watchdog_job = None
         cancel_event, serial = self.operations.begin()
         self.operations.finish(cancel_event, serial)
         self._worker_pool.shutdown()

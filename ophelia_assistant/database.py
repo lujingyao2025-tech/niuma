@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     location_source TEXT DEFAULT '',
     name_override TEXT DEFAULT '',
     location_override TEXT DEFAULT '',
+    sender_name_override TEXT DEFAULT '',
     subject TEXT DEFAULT '',
     body TEXT DEFAULT '',
     gender_label TEXT DEFAULT 'unspecified',
@@ -66,6 +67,8 @@ class Database:
                 conn.execute("ALTER TABLE tasks ADD COLUMN name_override TEXT DEFAULT ''")
             if "location_override" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN location_override TEXT DEFAULT ''")
+            if "sender_name_override" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN sender_name_override TEXT DEFAULT ''")
             if "profile_locked" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN profile_locked INTEGER DEFAULT 0")
             if "custom_variables" not in columns:
@@ -182,8 +185,10 @@ class Database:
             backups_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             return None
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
         target = backups_dir / f"ophelia_{stamp}.db"
+        if target.exists():
+            return target
         try:
             source = sqlite3.connect(self.path)
             destination = sqlite3.connect(target)
@@ -227,12 +232,21 @@ class Database:
         return True
 
     def daily_stats(self) -> dict[str, object]:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        local_now = datetime.now()
+        local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = local_start + timedelta(days=1)
+        utc_start = local_start.astimezone(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
+        utc_end = local_end.astimezone(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
         with self.connect() as conn:
             def count(column: str) -> int:
                 row = conn.execute(
-                    f"SELECT COUNT(*) AS n FROM tasks WHERE {column} LIKE ?",
-                    (today + "%",),
+                    f"SELECT COUNT(*) AS n FROM tasks "
+                    f"WHERE {column} >= ? AND {column} < ?",
+                    (utc_start, utc_end),
                 ).fetchone()
                 return int(row["n"])
 
@@ -299,6 +313,31 @@ class Database:
             ).fetchall()
         by_id = {int(row["id"]): row for row in rows}
         return [by_id[task_id] for task_id in ids if task_id in by_id]
+
+    def pending_tasks_by_profiles(
+        self, profile_numbers: list[int]
+    ) -> list[sqlite3.Row]:
+        """Return unsent tasks locked to the given windows for template sync."""
+        numbers = [int(number) for number in profile_numbers if int(number) > 0]
+        if not numbers:
+            return []
+        placeholders = ",".join("?" for _ in numbers)
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM tasks WHERE profile_no IN (" + placeholders + ") "
+                "AND status IN ('new', 'ready') ORDER BY id",
+                numbers,
+            ).fetchall()
+
+    def pending_counts_by_window(self) -> dict[int, int]:
+        """Count unsent tasks per window for balanced generation assignment."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT profile_no, COUNT(*) AS n FROM tasks "
+                "WHERE profile_no > 0 AND status NOT IN ('sent', 'replied') "
+                "GROUP BY profile_no"
+            ).fetchall()
+        return {int(row["profile_no"]): int(row["n"]) for row in rows}
 
     def update_task(self, task_id: int, **values: object) -> None:
         allowed = {
@@ -372,6 +411,21 @@ class Database:
                 f"UPDATE tasks SET status=?, {column}=? "
                 f"WHERE id IN ({placeholders})",
                 (status, stamp, *ids),
+            )
+            return int(cur.rowcount)
+
+    def unmark_sent(self, task_ids: list[int]) -> int:
+        """Undo a sent/replied mark and return the task to draft state."""
+        ids = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET status='drafted', sent_at=NULL, replied_at=NULL, "
+                f"last_error='' WHERE id IN ({placeholders}) "
+                "AND status IN ('sent', 'replied')",
+                ids,
             )
             return int(cur.rowcount)
 

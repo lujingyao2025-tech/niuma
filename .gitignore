@@ -7,3 +7,23 @@ dist/
 __pycache__/
 *.pyc
 *.pyo
+
+# Local release artifacts and generated documentation
+*.zip
+*.docx
+_doc_build/
+_ui_preview/
+doc_gen/
+desktop_check.png
+UI改版预览*.html
+
+# Product planning notes are not part of the reproducible source release
+NEXT_AI_需求清单.md
+牛马邮箱产品文档.md
+
+# Administrator-only licensing material must never enter source control
+admin_tools/
+tests/test_licensing.py
+
+# This directory is already a standalone application package.
+/__init__.py

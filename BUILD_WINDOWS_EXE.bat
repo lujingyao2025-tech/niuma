@@ -6,11 +6,11 @@ if not exist ".venv\Scripts\python.exe" (
   if errorlevel 1 goto :error
 )
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -r requirements.txt pyinstaller
+".venv\Scripts\python.exe" -m pip install -r requirements-lock.txt
 if errorlevel 1 goto :error
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --name NiuMaMail-v0.54.0 --icon "assets\niuma-mail-icon.ico" --add-data "assets;assets" --collect-all PIL --collect-all playwright app.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --name NiuMaMail-v0.90.0 --icon "assets\niuma-mail-icon.ico" --add-data "assets;assets" --collect-all PIL --collect-all playwright app.py
 if errorlevel 1 goto :error
-echo EXE created: dist\NiuMaMail-v0.54.0.exe
+echo EXE created: dist\NiuMaMail-v0.90.0.exe
 start "" "%~dp0dist"
 pause
 exit /b 0

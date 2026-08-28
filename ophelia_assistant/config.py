@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -11,6 +13,84 @@ MAX_WINDOW_SEQUENCE = 30
 BATCH_CONTACT_ROWS = 10
 MAX_CONTACT_ROWS = 100
 BATCH_DRAFT_INTERVAL_SECONDS = 3
+
+
+def _protect_secret(value: str) -> str:
+    """Encrypt a small secret with Windows DPAPI; falls back to plaintext."""
+    if not value or sys.platform != "win32":
+        return value
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        encoded = value.encode("utf-16-le")
+        blob_in = DATA_BLOB(
+            len(encoded),
+            ctypes.cast(
+                ctypes.create_string_buffer(encoded),
+                ctypes.POINTER(ctypes.c_byte),
+            ),
+        )
+        blob_out = DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        if crypt32.CryptProtectData(
+            ctypes.byref(blob_in),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(blob_out),
+        ):
+            raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            crypt32.LocalFree(blob_out.pbData)
+            return "enc:v1:" + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        pass
+    return value
+
+
+def _unprotect_secret(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("enc:v1:"):
+        return value
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        raw = base64.b64decode(value[len("enc:v1:"):], validate=True)
+        blob_in = DATA_BLOB(
+            len(raw),
+            ctypes.cast(ctypes.create_string_buffer(raw), ctypes.POINTER(ctypes.c_byte)),
+        )
+        blob_out = DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        if crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(blob_out),
+        ):
+            decrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            crypt32.LocalFree(blob_out.pbData)
+            return decrypted.decode("utf-16-le")
+    except Exception:
+        pass
+    return ""
 OLD_DEFAULT_SENDER_NAME = "Ophelia Carter"
 DEFAULT_SENDER_NAME = "Anna Lee"
 OLD_DEFAULT_SUBJECT_TEMPLATE = "A quick question about {location}"
@@ -114,6 +194,36 @@ def resolve_task_windows(profile_values, window_values) -> list[int | None]:
     return resolved
 
 
+def resolve_task_windows_balanced(
+    profile_values,
+    window_values,
+    pending_counts: dict[int, int] | None = None,
+) -> list[int | None]:
+    """Assign unassigned tasks to the least-busy window in sequence order."""
+    windows = normalize_window_sequence(window_values)
+    if not windows:
+        return [None] * len(profile_values)
+    counts = {
+        number: int((pending_counts or {}).get(number, 0)) for number in windows
+    }
+    resolved: list[int | None] = []
+    for raw_profile in profile_values:
+        try:
+            profile_no = int(raw_profile or 0)
+        except (TypeError, ValueError):
+            profile_no = 0
+        if profile_no > 0:
+            resolved.append(profile_no)
+            continue
+        candidate = min(
+            windows,
+            key=lambda number: (counts[number], windows.index(number)),
+        )
+        counts[candidate] += 1
+        resolved.append(candidate)
+    return resolved
+
+
 def app_data_dir() -> Path:
     root = Path(os.getenv("LOCALAPPDATA", Path.home() / ".ophelia-mail-assistant"))
     path = root / APP_NAME
@@ -129,13 +239,21 @@ class Settings:
     adspower_api_key: str = ""
     bitbrowser_url: str = "http://127.0.0.1:54345"
     sender_name: str = DEFAULT_SENDER_NAME
+    active_template_name: str = ""
+    signature: str = ""
     language: str = "zh"
+    theme_mode: str = "light"
+    skin_name: str = "bit-light"
+    skin_colors: dict[str, str] = field(default_factory=dict)
+    background_image: str = ""
+    last_update_check_at: str = ""
     subject_template: str = DEFAULT_SUBJECT_TEMPLATE
     body_template: str = DEFAULT_BODY_TEMPLATE
     custom_variables: dict[str, str] = field(default_factory=default_custom_variables)
     custom_variable_keys: list[str] = field(default_factory=list)
     hidden_system_variables: list[str] = field(default_factory=list)
     saved_templates: list[dict] = field(default_factory=list)
+    window_bindings: dict[str, dict] = field(default_factory=dict)
     update_url: str = ""
     window_sequence: list[int] = field(default_factory=list)
 
@@ -144,6 +262,17 @@ class Settings:
             self.browser_provider = "morelogin"
         if self.language not in {"zh", "en"}:
             self.language = "zh"
+        if self.theme_mode not in {"light", "dark"}:
+            self.theme_mode = "light"
+        raw_skin = self.skin_colors if isinstance(self.skin_colors, dict) else {}
+        self.skin_colors = {
+            str(key): str(value) for key, value in raw_skin.items()
+        }
+        if not isinstance(self.skin_name, str):
+            self.skin_name = "bit-light"
+        if not isinstance(self.background_image, str):
+            self.background_image = ""
+        self.adspower_api_key = _unprotect_secret(self.adspower_api_key)
         raw_custom_variables = self.custom_variables if isinstance(self.custom_variables, dict) else {}
         self.custom_variables = {
             str(key): str(value) for key, value in raw_custom_variables.items()
@@ -161,12 +290,22 @@ class Settings:
                 for key in self.hidden_system_variables
                 if str(key) in known_system
             ]
+        if not self.hidden_system_variables:
+            # Sender comes from the window binding; hide the confusing card.
+            self.hidden_system_variables = ["sender_name"]
         if not isinstance(self.saved_templates, list):
             self.saved_templates = []
         else:
             self.saved_templates = [
                 entry for entry in self.saved_templates if isinstance(entry, dict)
             ]
+        if not isinstance(self.window_bindings, dict):
+            self.window_bindings = {}
+        else:
+            self.window_bindings = {
+                str(window): (binding if isinstance(binding, dict) else {})
+                for window, binding in self.window_bindings.items()
+            }
         self.window_sequence = normalize_window_sequence(self.window_sequence)
 
     @classmethod
@@ -192,4 +331,9 @@ class Settings:
 
     def save(self) -> None:
         path = app_data_dir() / "settings.json"
-        path.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+        data = asdict(self)
+        data["adspower_api_key"] = _protect_secret(self.adspower_api_key)
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

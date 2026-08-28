@@ -71,7 +71,7 @@ def _gmail_page(browser: Browser) -> Page:
     page = _matching_page(browser, "mail.google.com") or _context(browser).new_page()
     if "mail.google.com" not in page.url:
         page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(800)
     if "accounts.google.com" in page.url:
         raise BrowserAutomationError("此浏览器窗口尚未登录 Gmail")
     return page
@@ -125,7 +125,7 @@ def _visible_largest(
 
 def _visible_inputs_by_position(
     scope: Locator,
-    timeout_ms: int = 5000,
+    timeout_ms: int = 3000,
     cancel_event: threading.Event | None = None,
 ) -> list[Locator]:
     """Find visible compose inputs from top to bottom for geometry fallback."""
@@ -157,7 +157,7 @@ def _compose_scope(page: Page, cancel_event: threading.Event | None = None) -> L
         'div[role="dialog"], div[aria-label*="New Message"], '
         'div[aria-label*="新邮件"], div[aria-label*="新郵件"]'
     )
-    dialog = _visible_last(dialogs, 20000, cancel_event)
+    dialog = _visible_last(dialogs, 5000, cancel_event)
     return dialog if dialog is not None else page.locator("body")
 
 
@@ -182,7 +182,7 @@ def _replace_compose_body(
     page.keyboard.press("Control+A")
     page.keyboard.press("Backspace")
     page.keyboard.insert_text(body)
-    page.wait_for_timeout(350)
+    page.wait_for_timeout(200)
     check_cancel(cancel_event)
 
     # Read through DOM evaluation instead of Locator.inner_text(). Gmail may
@@ -214,7 +214,7 @@ def _replace_compose_body(
             }""",
             body,
         )
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(200)
         current_text = body_box.evaluate(
             "element => element.innerText || element.textContent || ''"
         )
@@ -226,6 +226,14 @@ def _replace_compose_body(
         raise BrowserAutomationError("正文输入区已找到，但写入后未检测到邮件内容")
 
 
+def _input_has_value(control: Locator, expected: str) -> bool:
+    try:
+        actual = control.input_value(timeout=1000).strip()
+    except PlaywrightTimeoutError:
+        actual = ""
+    return actual == expected.strip()
+
+
 def _replace_text_control(
     page: Page,
     control: Locator,
@@ -233,29 +241,26 @@ def _replace_text_control(
     field_name: str,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Try native fill first, then focused keyboard replacement, and verify."""
+    """Fill a compose field fast, falling back to focused keyboard input."""
     check_cancel(cancel_event)
     try:
-        control.fill(value, timeout=5000)
+        control.fill(value, timeout=2000)
     except PlaywrightTimeoutError:
-        control.evaluate("element => element.focus()")
-        page.keyboard.press("Control+A")
-        page.keyboard.press("Backspace")
-        page.keyboard.insert_text(value)
+        # Gmail can keep compose inputs in a transient state where Playwright
+        # waits on actionability; focused keyboard input avoids that gate.
+        pass
+    if _input_has_value(control, value):
+        check_cancel(cancel_event)
+        return
+
     try:
-        actual = control.input_value(timeout=3000).strip()
-    except PlaywrightTimeoutError:
-        actual = ""
-    if actual != value.strip():
         control.evaluate("element => element.focus()")
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")
         page.keyboard.insert_text(value)
-        try:
-            actual = control.input_value(timeout=3000).strip()
-        except PlaywrightTimeoutError:
-            actual = ""
-    if actual != value.strip():
+    except PlaywrightError as exc:
+        raise BrowserAutomationError(f"{field_name}输入框已找到，但无法写入内容") from exc
+    if not _input_has_value(control, value):
         raise BrowserAutomationError(f"{field_name}输入框已找到，但页面回读内容不一致")
     check_cancel(cancel_event)
 
@@ -264,7 +269,7 @@ def _control_hint(control: Locator) -> str:
     values = []
     for attribute in ("name", "aria-label", "placeholder", "role", "peoplekit-id"):
         try:
-            values.append(control.get_attribute(attribute, timeout=1500) or "")
+            values.append(control.get_attribute(attribute, timeout=300) or "")
         except PlaywrightTimeoutError:
             values.append("")
     return " ".join(values).lower()
@@ -294,17 +299,17 @@ def _recipient_control(
         'input[placeholder*="Recipient" i], input[placeholder*="收件人"], '
         'input[placeholder*="收件者"]'
     )
-    control = _visible_last(scope.locator(selectors), 3500, cancel_event)
+    control = _visible_last(scope.locator(selectors), 2000, cancel_event)
     if control is not None:
         return control
-    prompt = _visible_last(scope.get_by_text(RECIPIENT_LABEL_RE, exact=True), 2500, cancel_event)
+    prompt = _visible_last(scope.get_by_text(RECIPIENT_LABEL_RE, exact=True), 1200, cancel_event)
     if prompt is not None:
         prompt.click()
-        control = _visible_last(scope.locator(selectors), 2500, cancel_event)
+        control = _visible_last(scope.locator(selectors), 1200, cancel_event)
         if control is not None:
             return control
     # Gmail variants may expose only a generic combobox after To receives focus.
-    inputs = _visible_inputs_by_position(scope, 2500, cancel_event)
+    inputs = _visible_inputs_by_position(scope, 1500, cancel_event)
     for candidate in inputs:
         if not _looks_like_subject(candidate):
             return candidate
@@ -321,17 +326,17 @@ def _subject_control(
         'input[aria-label*="主旨"], input[placeholder*="主题"], '
         'input[placeholder*="主旨"]'
     )
-    control = _visible_last(scope.locator(selectors), 5000, cancel_event)
+    control = _visible_last(scope.locator(selectors), 2000, cancel_event)
     if control is not None:
         return control
-    prompt = _visible_last(scope.get_by_text(SUBJECT_LABEL_RE, exact=True), 2500, cancel_event)
+    prompt = _visible_last(scope.get_by_text(SUBJECT_LABEL_RE, exact=True), 1200, cancel_event)
     if prompt is not None:
         prompt.click()
-        control = _visible_last(scope.locator(selectors), 2000, cancel_event)
+        control = _visible_last(scope.locator(selectors), 1200, cancel_event)
         if control is not None:
             return control
     # Subject is the lower of the compact visible input rows in the compose box.
-    inputs = _visible_inputs_by_position(scope, 2500, cancel_event)
+    inputs = _visible_inputs_by_position(scope, 1500, cancel_event)
     for candidate in reversed(inputs):
         if _looks_like_subject(candidate):
             return candidate
@@ -353,7 +358,7 @@ def _fill_open_compose(
             'div[role="dialog"], div[aria-label*="New Message"], '
             'div[aria-label*="新邮件"], div[aria-label*="新郵件"]'
         ),
-        8000,
+        5000,
         cancel_event,
     )
     if dialog is None and "view=cm" not in page.url and "compose" not in page.url:
@@ -382,7 +387,7 @@ def _fill_open_compose(
         'div[contenteditable="true"][aria-label*="郵件正文"], '
         'div[contenteditable="true"][aria-label*="郵件內文"], '
         'div[contenteditable="true"][aria-label*="正文"]'
-    ), 8000, cancel_event)
+    ), 4000, cancel_event)
     if body_box is None:
         # The body is the large third editable area. Choosing the largest visible
         # contenteditable avoids confusing it with compact recipient controls.
@@ -390,18 +395,18 @@ def _fill_open_compose(
             'div[contenteditable="true"][aria-multiline="true"], '
             'div[contenteditable="true"][role="textbox"], '
             'div[contenteditable="true"]'
-        ), 5000, cancel_event)
+        ), 3000, cancel_event)
     if body_box is not None:
         _replace_compose_body(page, body_box, body, cancel_event)
     else:
         body_prompt = _visible_last(scope.get_by_text(
             re.compile(r"Press\s*/\s*for Help me write|撰写邮件|撰寫郵件", re.I)
-        ), 5000, cancel_event)
+        ), 3000, cancel_event)
         if body_prompt is None:
             raise BrowserAutomationError("已填写收件人和主题，但找不到正文大输入框（第三个输入区）")
         body_prompt.click()
         page.keyboard.insert_text(body)
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(200)
         try:
             scope_text = scope.evaluate(
                 "element => element.innerText || element.textContent || ''"
@@ -427,20 +432,20 @@ def _open_compose_by_button(
     compose = _visible_last(page.locator(
         'div[gh="cm"], div[role="button"][aria-label*="Compose" i], '
         'div[role="button"][aria-label*="撰写"], div[role="button"][aria-label*="撰寫"]'
-    ), 20000, cancel_event)
+    ), 8000, cancel_event)
     if compose is None:
         compose = _visible_last(page.get_by_text(
             re.compile(r"^(Compose|撰写|寫郵件|撰寫)$", re.I), exact=True
-        ), 5000, cancel_event)
+        ), 3000, cancel_event)
     if compose is None:
         page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=60000)
-        compose = _visible_last(page.locator('div[gh="cm"]'), 20000, cancel_event)
+        compose = _visible_last(page.locator('div[gh="cm"]'), 12000, cancel_event)
     if compose is None:
         raise BrowserAutomationError("Gmail 已打开，但找不到左侧 Compose 写信按钮")
     compose.click()
     check_cancel(cancel_event)
     # Gmail may open Compose in a new tab. Prefer that tab for filling.
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
         compose_page = _compose_page(browser)
@@ -551,19 +556,18 @@ def wait_for_gmail_send(
     timeout_ms: int = 300_000,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Wait until Gmail shows the sent confirmation toast."""
+    """Wait until Gmail shows the transient sent toast (role=alert only)."""
     page = _compose_page(browser) or _gmail_page(browser)
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
         try:
-            text = page.evaluate(
-                "document.body ? document.body.innerText : ''"
-            )
+            alerts = page.locator('[role="alert"]').all_inner_texts()
         except PlaywrightError:
-            text = ""
-        if re.search(r"Message sent|已发送|已寄出|寄出", str(text), re.I):
-            return
+            alerts = []
+        for alert in alerts:
+            if re.search(r"Message sent|已发送|已寄出", str(alert), re.I):
+                return
         time.sleep(1)
     raise BrowserAutomationError(
         f"等待 Gmail 发送确认超时（{timeout_ms // 1000} 秒），请检查该窗口是否已发送"

@@ -12,6 +12,7 @@ def _install_logging() -> None:
 
     log_dir = app_data_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
+    _maintain_logs(log_dir)
     logging.basicConfig(
         filename=log_dir / "app.log",
         level=logging.INFO,
@@ -34,6 +35,27 @@ def _install_logging() -> None:
 
     threading.excepthook = handle_thread_exception
     sys.excepthook = handle_main_exception
+
+
+def _maintain_logs(log_dir) -> None:
+    """Keep only recent logs and rotate oversized files."""
+    from datetime import datetime
+
+    now = datetime.now().timestamp()
+    cutoff = now - 3 * 24 * 60 * 60
+    for path in log_dir.glob("app*.log"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+    main_log = log_dir / "app.log"
+    try:
+        if main_log.exists() and main_log.stat().st_size > 5 * 1024 * 1024:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            main_log.replace(log_dir / f"app-{stamp}.log")
+    except OSError:
+        pass
 
 
 def _terminate_other_niuma_instances() -> None:
@@ -86,7 +108,7 @@ if __name__ == "__main__":
     _terminate_other_niuma_instances()
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NiuMaMail.0.74.0")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NiuMaMail.0.90.0")
         except OSError:
             pass
     main()

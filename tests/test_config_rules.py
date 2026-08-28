@@ -11,7 +11,7 @@ from ophelia_assistant.config import (
 )
 
 
-class Version054RulesTests(unittest.TestCase):
+class ConfigRulesTests(unittest.TestCase):
     def test_window_sequence_accepts_thirty(self):
         values = list(range(1, 31))
         self.assertEqual(normalize_window_sequence(values), values)
@@ -29,10 +29,13 @@ class Version054RulesTests(unittest.TestCase):
     def test_free_trial_is_three_days(self):
         previous_machine = os.environ.get("NIUMA_MAIL_MACHINE_ID")
         previous_dir = os.environ.get("NIUMA_MAIL_TRIAL_DIR")
+        previous_registry = os.environ.get("NIUMA_MAIL_DISABLE_REGISTRY")
         try:
-                os.environ["NIUMA_MAIL_MACHINE_ID"] = "source-v054-test"
-                with tempfile.TemporaryDirectory() as directory:
-                    os.environ["NIUMA_MAIL_TRIAL_DIR"] = directory
+            os.environ["NIUMA_MAIL_MACHINE_ID"] = "source-v090-test"
+            os.environ["NIUMA_MAIL_DISABLE_REGISTRY"] = "1"
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["NIUMA_MAIL_TRIAL_DIR"] = directory
+                with mock.patch.object(trial, "_MACHINE_SOURCE_CACHE", None):
                     with mock.patch("ophelia_assistant.trial._read_registry", return_value=None):
                         now = 1_800_000_000
                         status = trial.check_trial(now=now)
@@ -47,6 +50,10 @@ class Version054RulesTests(unittest.TestCase):
                 os.environ.pop("NIUMA_MAIL_TRIAL_DIR", None)
             else:
                 os.environ["NIUMA_MAIL_TRIAL_DIR"] = previous_dir
+            if previous_registry is None:
+                os.environ.pop("NIUMA_MAIL_DISABLE_REGISTRY", None)
+            else:
+                os.environ["NIUMA_MAIL_DISABLE_REGISTRY"] = previous_registry
 
 
 if __name__ == "__main__":

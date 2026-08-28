@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from typing import Callable
 
@@ -16,6 +17,14 @@ from .database import Database, now_iso
 from .mail_content import city_only, has_city, render_email, salutation_name
 from .morelogin import create_browser_provider
 from .operation import check_cancel
+
+
+def _row_value(row, key: str, default: str = "") -> str:
+    """Read a database row field that may be a sqlite3.Row or a dict."""
+    try:
+        return str(row[key] or default)
+    except (KeyError, IndexError, TypeError):
+        return default
 
 
 class Workflow:
@@ -40,7 +49,9 @@ class Workflow:
         location = city_only(task["location_override"] or task["location"])
         self._save_local_email(task_id, name, location, cancel_event)
 
-    def apply_manual_profile(self, task_id: int, name: str, location: str) -> None:
+    def apply_manual_profile(
+        self, task_id: int, name: str, location: str, sender_name: str = ""
+    ) -> None:
         task = self._task(task_id)
         clean_name = name.strip() or str(
             task["name_override"]
@@ -51,18 +62,22 @@ class Workflow:
         clean_location = city_only(
             location.strip() or str(task["location_override"] or task["location"] or "")
         )
-        self._save_local_email(task_id, clean_name, clean_location)
+        self._save_local_email(task_id, clean_name, clean_location, sender_name)
 
     def _save_local_email(
         self,
         task_id: int,
         name: str,
         location: str,
+        sender_name: str = "",
         cancel_event: threading.Event | None = None,
     ) -> None:
         task = self._task(task_id)
         clean_name = " ".join(str(name or "").strip().split())
         clean_location = city_only(location)
+        clean_sender = " ".join(str(sender_name or "").strip().split())
+        if not clean_sender:
+            clean_sender = _row_value(task, "sender_name_override").strip()
         hidden = set(self.settings.hidden_system_variables)
         if not clean_name and "first_name" not in hidden:
             raise ValueError("请填写联系人名字")
@@ -87,13 +102,8 @@ class Workflow:
                 }
         custom_variables = dict(self.settings.custom_variables)
         custom_variables.update(task_custom)
-        subject, body = render_email(
-            contact_name,
-            clean_location,
-            self.settings.sender_name,
-            self.settings.subject_template,
-            self.settings.body_template,
-            custom_variables,
+        subject, body = self._render_email_for_task(
+            task, contact_name, clean_location, custom_variables
         )
         check_cancel(cancel_event)
         self.db.update_task(
@@ -102,6 +112,7 @@ class Workflow:
             location_override=clean_location,
             location=clean_location,
             location_source="manual",
+            sender_name_override=clean_sender,
             subject=subject,
             body=body,
             source_urls="[]",
@@ -110,6 +121,71 @@ class Workflow:
             generated_at=now_iso(),
             last_error="",
         )
+
+    def _draft_template(self, task) -> tuple[dict | None, dict]:
+        """Return (window-bound template, window binding) for a task."""
+        binding = (self.settings.window_bindings or {}).get(
+            str(task["profile_no"])
+        ) or {}
+        template = None
+        template_name = binding.get("template_name")
+        if template_name:
+            template = next(
+                (
+                    item
+                    for item in self.settings.saved_templates
+                    if item.get("name") == template_name
+                ),
+                None,
+            )
+        return template, binding
+
+    def _render_email_for_task(
+        self,
+        task,
+        contact_name: str,
+        location: str,
+        custom_variables: dict[str, str],
+    ) -> tuple[str, str]:
+        """Render with the window-bound template first, then the active template."""
+        template, binding = self._draft_template(task)
+        task_sender = _row_value(task, "sender_name_override").strip()
+        if template:
+            subject_template = (
+                template.get("subject_template")
+                or self.settings.subject_template
+            )
+            body_template = template.get("body_template") or self.settings.body_template
+            sender = (
+                task_sender
+                or binding.get("sender_name")
+                or template.get("sender_name")
+                or self.settings.sender_name
+            )
+            signature = template.get("signature") or self.settings.signature
+            custom = dict(custom_variables)
+            custom.update(template.get("custom_variables") or {})
+        else:
+            subject_template = self.settings.subject_template
+            body_template = self.settings.body_template
+            sender = (
+                task_sender
+                or binding.get("sender_name")
+                or self.settings.sender_name
+            )
+            signature = self.settings.signature
+            custom = dict(custom_variables)
+        subject, body = render_email(
+            contact_name,
+            location,
+            sender,
+            subject_template,
+            body_template,
+            custom,
+        )
+        if signature:
+            body = body.rstrip() + "\n\n" + signature.strip()
+        return subject, body
 
     def open_draft(
         self,
@@ -123,13 +199,14 @@ class Workflow:
             raise ValueError("请在邮件预览下方选择并确认浏览器窗口")
         conn = self.browser_provider.start_profile(task["profile_no"])
         check_cancel(cancel_event)
+        subject, body = str(task["subject"] or ""), str(task["body"] or "")
         with connected_browser(conn.cdp_url) as (_, browser):
             try:
                 accuracy = prepare_gmail_draft(
                     browser,
                     task["recipient_email"],
-                    task["subject"],
-                    task["body"],
+                    subject,
+                    body,
                     progress,
                     cancel_event,
                 )
@@ -158,21 +235,22 @@ class Workflow:
             raise ValueError("请在邮件预览下方选择并确认浏览器窗口")
         conn = self.browser_provider.start_profile(task["profile_no"])
         check_cancel(cancel_event)
+        subject, body = str(task["subject"] or ""), str(task["body"] or "")
         with connected_browser(conn.cdp_url) as (_, browser):
             try:
                 accuracy = prepare_gmail_draft(
                     browser,
                     task["recipient_email"],
-                    task["subject"],
-                    task["body"],
+                    subject,
+                    body,
                     progress,
                     cancel_event,
                 )
                 if not verify_draft_fields(
                     browser,
                     task["recipient_email"],
-                    task["subject"],
-                    task["body"],
+                    subject,
+                    body,
                 ):
                     raise BrowserAutomationError(
                         "草稿校验未通过：Gmail 中的收件人/主题/正文与任务不一致，请手动核对"
@@ -191,6 +269,9 @@ class Workflow:
         return accuracy
 
     def _record_failure(self, task_id: int, exc: Exception) -> None:
+        logging.getLogger("niuma-mail").error(
+            "任务 %s 执行失败：%s", task_id, exc, exc_info=True
+        )
         try:
             row = self.db.get_task(task_id)
             attempts = int(row["attempts"] or 0) if row is not None else 0
