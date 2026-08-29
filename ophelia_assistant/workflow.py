@@ -17,6 +17,11 @@ from .browser import (
 )
 from .config import Settings
 from .database import Database, now_iso
+from .diagnostics import (
+    recent_trail,
+    trace_execution,
+    write_error_report,
+)
 from .mail_content import city_only, has_city, render_email, salutation_name
 from .morelogin import create_browser_provider
 from .operation import OperationCancelledError, check_cancel
@@ -251,6 +256,9 @@ class Workflow:
             last_error="",
             failure_stage="",
         )
+        trace_execution(
+            task_id, "start", "开始执行", profile_no=task["profile_no"]
+        )
         conn = self.browser_provider.start_profile(task["profile_no"])
         check_cancel(cancel_event)
         subject, body = str(task["subject"] or ""), str(task["body"] or "")
@@ -282,6 +290,10 @@ class Workflow:
             last_error="",
             failure_stage="",
         )
+        trace_execution(
+            task_id, "filled", "Gmail 草稿填写完成",
+            profile_no=task["profile_no"],
+        )
         return accuracy
 
     def open_and_send(
@@ -303,6 +315,9 @@ class Workflow:
             browser_type=self.settings.browser_provider,
             last_error="",
             failure_stage="",
+        )
+        trace_execution(
+            task_id, "start", "开始自动发送", profile_no=task["profile_no"]
         )
         try:
             conn = self.browser_provider.start_profile(task["profile_no"])
@@ -334,6 +349,10 @@ class Workflow:
                 )
                 raise
             self.db.update_task(task_id, status="drafted", drafted_at=now_iso())
+            trace_execution(
+                task_id, "filled", "Gmail 草稿填写完成",
+                profile_no=task["profile_no"],
+            )
             try:
                 if not verify_draft_fields(
                     browser,
@@ -344,6 +363,10 @@ class Workflow:
                     raise BrowserAutomationError(
                         "草稿校验未通过：Gmail 中的收件人/主题/正文与任务不一致，请手动核对"
                     )
+                trace_execution(
+                    task_id, "verified", "Gmail 字段完整校验通过",
+                    profile_no=task["profile_no"],
+                )
             except OperationCancelledError:
                 self._mark_cancelled(task_id)
                 raise
@@ -376,6 +399,10 @@ class Workflow:
                     status="sending",
                     send_clicked_at=now_iso(),
                 )
+                trace_execution(
+                    task_id, "send_clicked", "已点击 Gmail 发送按钮",
+                    profile_no=task["profile_no"],
+                )
                 # In-flight sends must finish: do not cancel while waiting.
                 try:
                     wait_for_gmail_send(browser)
@@ -400,6 +427,10 @@ class Workflow:
             last_error="",
             failure_stage="",
         )
+        trace_execution(
+            task_id, "sent", "Gmail 已确认发送成功",
+            profile_no=task["profile_no"],
+        )
         return accuracy
 
     def open_draft_wait_send(
@@ -415,6 +446,11 @@ class Workflow:
 
     def _mark_cancelled(self, task_id: int) -> None:
         try:
+            row = self.db.get_task(task_id)
+            profile = int(row["profile_no"]) if row is not None else None
+            trace_execution(
+                task_id, "cancelled", "用户取消任务", profile_no=profile
+            )
             self.db.update_task(
                 task_id,
                 status="cancelled",
@@ -435,6 +471,22 @@ class Workflow:
         )
         try:
             row = self.db.get_task(task_id)
+            profile = int(row["profile_no"]) if row is not None else None
+            trace_execution(
+                task_id,
+                stage or "unknown",
+                str(exc),
+                profile_no=profile,
+                extra={"exception": type(exc).__name__},
+            )
+            write_error_report(
+                exc,
+                task_id=task_id,
+                stage=stage,
+                profile_no=profile,
+                settings=self.settings,
+                extra_trail=recent_trail(task_id, limit=30),
+            )
             attempts = int(row["attempts"] or 0) if row is not None else 0
             self.db.update_task(
                 task_id,

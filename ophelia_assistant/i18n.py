@@ -717,4 +717,9 @@ TRANSLATIONS.update({
     "备份文件不是有效的数据库。": "The backup file is not a valid database.",
     "任务仍在运行": "Tasks Still Running",
     "仍有后台任务未结束（例如正在等待 Gmail 发送结果）。确定立即退出？": "Background tasks are still running (for example waiting for a Gmail send result). Quit now?",
+    "错误报告已保存：{path}": "Error report saved: {path}",
+    "后台操作失败": "Background operation failed",
+    "打开日志/错误报告文件夹": "Open Logs / Error Reports",
+    "打开错误报告文件夹": "Open Error Reports",
+    "程序错误": "Program Error",
 })

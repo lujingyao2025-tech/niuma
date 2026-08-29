@@ -17,7 +17,7 @@ logger = logging.getLogger("niuma-mail")
 class WorkerSignals(QObject):
     progress = Signal(int, str)
     done = Signal(object)
-    error = Signal(str)
+    error = Signal(object)
     finished = Signal()
 
 
@@ -44,9 +44,8 @@ class FunctionWorker(QRunnable):
             pass
         except Exception as exc:
             logger.exception("Studio background task failed")
-            self.signals.error.emit(str(exc))
+            self.signals.error.emit(exc)
         else:
             self.signals.done.emit(result)
         finally:
             self.signals.finished.emit()
-

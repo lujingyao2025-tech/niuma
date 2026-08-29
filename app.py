@@ -3,8 +3,6 @@ import logging
 import sys
 import threading
 
-from ophelia_assistant.ui import main
-
 
 def _install_logging() -> None:
     from ophelia_assistant.config import app_data_dir

@@ -104,12 +104,17 @@ class SendGuardTests(unittest.TestCase):
             def update_task(self, task_id, **values):
                 self.updated = values
 
-        database = FakeDatabase()
-        workflow = Workflow(db=database, settings=Settings())
-        workflow._record_failure(1, RuntimeError("连接失败"), "connect")
-        self.assertEqual(database.updated["status"], "failed")
-        self.assertEqual(database.updated["failure_stage"], "connect")
-        self.assertEqual(database.updated["attempts"], 1)
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch(
+                "ophelia_assistant.config.app_data_dir",
+                return_value=Path(temp),
+            ):
+                database = FakeDatabase()
+                workflow = Workflow(db=database, settings=Settings())
+                workflow._record_failure(1, RuntimeError("连接失败"), "connect")
+                self.assertEqual(database.updated["status"], "failed")
+                self.assertEqual(database.updated["failure_stage"], "connect")
+                self.assertEqual(database.updated["attempts"], 1)
 
 
 class StatsAndMigrationTests(unittest.TestCase):

@@ -41,6 +41,7 @@ from ..config import (
     is_newer_version,
 )
 from ..database import Database, now_iso
+from ..diagnostics import write_error_report
 from ..i18n import LANGUAGES, set_language, tr
 from ..mail_content import render_email
 from ..morelogin import BROWSER_PROVIDER_NAMES, create_browser_provider
@@ -593,12 +594,21 @@ class MainWindow(QMainWindow):
             if self.operations.is_current(cancel_event, serial) and on_done is not None:
                 on_done(result)
 
-        def on_error_message(message):
+        def on_error_message(exc):
             if self.operations.is_current(cancel_event, serial):
+                report_path = write_error_report(
+                    exc,
+                    title=tr("后台操作失败"),
+                    settings=self.settings,
+                )
                 if on_error is not None:
-                    on_error(message)
+                    on_error(exc)
                 else:
-                    self.show_error(tr("操作失败"), message)
+                    self.show_error(
+                        tr("操作失败"),
+                        f"{exc}\n\n{tr('错误报告已保存：{path}')}"
+                        .format(path=report_path),
+                    )
 
         def on_finished():
             if self.operations.is_current(cancel_event, serial):
@@ -1137,8 +1147,8 @@ class MainWindow(QMainWindow):
             self.pages[0].window_panel.load()
             self.set_status(tr("已填充 {count} 个窗口编号").format(count=len(numbers)))
 
-        def error(message):
-            self.show_error(tr("读取窗口失败"), message)
+        def error(exc):
+            self.show_error(tr("读取窗口失败"), str(exc))
 
         self.run_async(run, on_done=done, on_error=error)
 
@@ -1214,7 +1224,9 @@ class MainWindow(QMainWindow):
             self.show_error(tr("恢复失败"), tr("备份文件无法读取。"))
 
     def open_log_folder(self) -> None:
-        folder = str(app_data_dir())
+        from ..diagnostics import diagnostics_dir
+
+        folder = str(diagnostics_dir())
         try:
             if sys.platform == "win32":
                 os.startfile(folder)
@@ -1288,14 +1300,15 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.Yes and sys.platform == "win32":
                 os.startfile(downloaded_path)
 
-        def error(message):
-            self.show_error(tr("检查更新失败"), message)
+        def error(exc):
+            self.show_error(tr("检查更新失败"), str(exc))
 
         self.run_async(run, on_done=done, on_error=error)
 
     # ----------------------------------------------------------- command bar
     def open_command_palette(self) -> None:
         actions = [
+            (tr("打开错误报告文件夹"), "", self.open_log_folder),
             (tr("载入示例数据"), "", self.load_demo_data),
             (tr("新建活动/批次"), tr("Ctrl+N"), self.create_campaign),
             (tr("导入联系人"), tr("Ctrl+I"), self.import_contacts),

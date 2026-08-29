@@ -571,7 +571,7 @@ class SettingsPage(QWidget):
         backup_button.clicked.connect(self.window.backup_database)
         restore_button = QPushButton(tr("从备份恢复"))
         restore_button.clicked.connect(self.window.restore_database)
-        log_button = QPushButton(tr("打开日志文件夹"))
+        log_button = QPushButton(tr("打开日志/错误报告文件夹"))
         log_button.clicked.connect(self.window.open_log_folder)
         update_button = QPushButton(tr("检查更新"))
         update_button.clicked.connect(lambda: self.window.check_update())
