@@ -7,12 +7,24 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 APP_NAME = "NiuMaMail"
 MAX_CONCURRENT_TASKS = 30
 MAX_WINDOW_SEQUENCE = 30
 BATCH_CONTACT_ROWS = 10
 MAX_CONTACT_ROWS = 100
 BATCH_DRAFT_INTERVAL_SECONDS = 3
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    """Compare application versions using PEP 440 instead of string order."""
+    try:
+        return Version(str(candidate).strip().lstrip("v")) > Version(
+            str(current).strip().lstrip("v")
+        )
+    except InvalidVersion:
+        return False
 
 
 def _protect_secret(value: str) -> str:
@@ -256,6 +268,7 @@ class Settings:
     window_bindings: dict[str, dict] = field(default_factory=dict)
     update_url: str = ""
     window_sequence: list[int] = field(default_factory=list)
+    auto_click_send: bool = False
 
     def __post_init__(self) -> None:
         if self.browser_provider not in {"morelogin", "adspower", "bitbrowser"}:
@@ -332,7 +345,13 @@ class Settings:
     def save(self) -> None:
         path = app_data_dir() / "settings.json"
         data = asdict(self)
-        data["adspower_api_key"] = _protect_secret(self.adspower_api_key)
+        if self.adspower_api_key and sys.platform == "win32":
+            protected = _protect_secret(self.adspower_api_key)
+            if protected == self.adspower_api_key:
+                raise RuntimeError(
+                    "无法加密 API Key，已取消保存；请检查系统安全设置后重试"
+                )
+            data["adspower_api_key"] = protected
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",

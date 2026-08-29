@@ -23,7 +23,7 @@ NEXT_AI_需求清单.md
 
 # Administrator-only licensing material must never enter source control
 admin_tools/
-tests/test_licensing.py
+/.impeccable/
 
 # This directory is already a standalone application package.
 /__init__.py

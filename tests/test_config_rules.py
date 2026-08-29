@@ -7,6 +7,7 @@ from ophelia_assistant import trial
 from ophelia_assistant.config import (
     MAX_CONCURRENT_TASKS,
     MAX_WINDOW_SEQUENCE,
+    is_newer_version,
     normalize_window_sequence,
 )
 
@@ -25,6 +26,12 @@ class ConfigRulesTests(unittest.TestCase):
     def test_window_sequence_rejects_duplicates(self):
         with self.assertRaises(ValueError):
             normalize_window_sequence([1, 2, 2])
+
+    def test_version_comparison_is_semantic(self):
+        self.assertTrue(is_newer_version("0.10.0", "0.9.0"))
+        self.assertTrue(is_newer_version("v1.0.0", "0.90.0"))
+        self.assertFalse(is_newer_version("0.9.0", "0.10.0"))
+        self.assertFalse(is_newer_version("not-a-version", "0.90.0"))
 
     def test_free_trial_is_three_days(self):
         previous_machine = os.environ.get("NIUMA_MAIL_MACHINE_ID")

@@ -7,6 +7,7 @@ from typing import Callable
 
 from .browser import (
     BrowserAutomationError,
+    click_gmail_send,
     connected_browser,
     prepare_gmail_draft,
     verify_draft_fields,
@@ -47,7 +48,12 @@ class Workflow:
             )
         ).strip()
         location = city_only(task["location_override"] or task["location"])
-        self._save_local_email(task_id, name, location, cancel_event)
+        self._save_local_email(
+            task_id,
+            name,
+            location,
+            cancel_event=cancel_event,
+        )
 
     def apply_manual_profile(
         self, task_id: int, name: str, location: str, sender_name: str = ""
@@ -255,6 +261,8 @@ class Workflow:
                     raise BrowserAutomationError(
                         "草稿校验未通过：Gmail 中的收件人/主题/正文与任务不一致，请手动核对"
                     )
+                if getattr(self.settings, "auto_click_send", False):
+                    click_gmail_send(browser, cancel_event=cancel_event)
                 wait_for_gmail_send(browser, cancel_event=cancel_event)
             except Exception as exc:
                 self._record_failure(task_id, exc)

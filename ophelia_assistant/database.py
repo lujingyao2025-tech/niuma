@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts INTEGER DEFAULT 0,
     UNIQUE(profile_no, source_key, recipient_email)
 );
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -101,6 +109,14 @@ class Database:
                     FROM tasks_legacy_source"""
                 )
                 conn.execute("DROP TABLE tasks_legacy_source")
+            if "campaign_id" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER")
+            default_id = self._default_campaign_id(conn)
+            conn.execute(
+                "UPDATE tasks SET campaign_id = ? "
+                "WHERE campaign_id IS NULL OR campaign_id = 0",
+                (default_id,),
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -119,8 +135,13 @@ class Database:
         location: str,
         email: str,
         custom_variables: dict[str, str] | None = None,
+        campaign_id: int | None = None,
     ) -> int:
-        task_ids = self.add_local_tasks([(name, location, email)], [custom_variables])
+        task_ids = self.add_local_tasks(
+            [(name, location, email)],
+            [custom_variables],
+            campaign_id=campaign_id,
+        )
         task_id = task_ids[0]
         if task_id is None:
             raise ValueError("该邮箱任务已经存在")
@@ -130,6 +151,7 @@ class Database:
         self,
         contacts: list[tuple[str, str, str]],
         custom_variables_list: list[dict[str, str] | None] | None = None,
+        campaign_id: int | None = None,
     ) -> list[int | None]:
         """Insert manual rows; re-importing an email refreshes its local data."""
         if not contacts:
@@ -138,6 +160,7 @@ class Database:
         task_ids: list[int | None] = []
         custom_values = custom_variables_list or []
         with self.connect() as conn:
+            resolved_campaign = campaign_id or self._default_campaign_id(conn)
             for index, (name, location, email) in enumerate(contacts):
                 custom = custom_values[index] if index < len(custom_values) else {}
                 if not isinstance(custom, dict):
@@ -145,38 +168,225 @@ class Database:
                 serialized_custom = json.dumps(
                     custom, ensure_ascii=False, sort_keys=True
                 )
+                normalized_email = email.strip().lower()
+                normalized_name = " ".join(name.strip().split())
+                normalized_location = location.strip()
+                existing = conn.execute(
+                    """SELECT id FROM tasks
+                    WHERE source_key = '' AND recipient_email = ?
+                    ORDER BY id LIMIT 1""",
+                    (normalized_email,),
+                ).fetchone()
+                if existing is None:
+                    cursor = conn.execute(
+                        """INSERT INTO tasks(
+                            profile_no, source_key, recipient_email,
+                            name_override, location_override, location,
+                            location_source, custom_variables, campaign_id, created_at
+                        ) VALUES(0, '', ?, ?, ?, ?, 'manual', ?, ?, ?)""",
+                        (
+                            normalized_email,
+                            normalized_name,
+                            normalized_location,
+                            normalized_location,
+                            serialized_custom,
+                            resolved_campaign,
+                            created_at,
+                        ),
+                    )
+                    task_ids.append(int(cursor.lastrowid))
+                    continue
+                task_id = int(existing["id"])
                 conn.execute(
-                    """INSERT INTO tasks(
-                        profile_no, source_key, recipient_email,
-                        name_override, location_override, location,
-                        location_source, custom_variables, created_at
-                    ) VALUES(0, '', ?, ?, ?, ?, 'manual', ?, ?)
-                    ON CONFLICT(profile_no, source_key, recipient_email) DO UPDATE SET
-                        name_override = excluded.name_override,
-                        location_override = excluded.location_override,
-                        location = excluded.location,
-                        location_source = excluded.location_source,
-                        custom_variables = excluded.custom_variables""",
+                    """UPDATE tasks SET
+                        name_override=?, location_override=?, location=?,
+                        location_source='manual', custom_variables=?
+                    WHERE id=?""",
                     (
-                        email.strip().lower(),
-                        " ".join(name.strip().split()),
-                        location.strip(),
-                        location.strip(),
+                        normalized_name,
+                        normalized_location,
+                        normalized_location,
                         serialized_custom,
-                        created_at,
+                        task_id,
                     ),
                 )
-                task_row = conn.execute(
-                    """SELECT id FROM tasks
-                    WHERE profile_no = 0 AND source_key = '' AND recipient_email = ?""",
-                    (email.strip().lower(),),
-                ).fetchone()
-                task_ids.append(int(task_row[0]) if task_row is not None else None)
+                task_ids.append(task_id)
         return task_ids
 
     def list_tasks(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
+
+    @staticmethod
+    def _default_campaign_id(conn) -> int:
+        row = conn.execute(
+            "SELECT id FROM campaigns WHERE name = ? ORDER BY id LIMIT 1",
+            ("默认批次",),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        now = now_iso()
+        cursor = conn.execute(
+            "INSERT INTO campaigns(name, note, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("默认批次", "", now, now),
+        )
+        return int(cursor.lastrowid)
+
+    def list_campaigns(self) -> list[dict[str, object]]:
+        """Return campaigns with task counts for the batch list."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT c.id, c.name, c.note, c.created_at, c.updated_at,
+                        COUNT(t.id) AS task_count,
+                        SUM(CASE WHEN t.status IN ('sent', 'replied')
+                            THEN 1 ELSE 0 END) AS sent_count,
+                        SUM(CASE WHEN t.status IN ('new', 'needs_review')
+                            THEN 1 ELSE 0 END) AS pending_count,
+                        SUM(CASE WHEN t.status = 'drafted'
+                            THEN 1 ELSE 0 END) AS drafted_count,
+                        SUM(CASE WHEN t.last_error <> ''
+                            THEN 1 ELSE 0 END) AS failed_count
+                    FROM campaigns c
+                    LEFT JOIN tasks t ON t.campaign_id = c.id
+                    GROUP BY c.id
+                    ORDER BY c.created_at DESC, c.id DESC"""
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "name": str(row["name"]),
+                "note": str(row["note"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "task_count": int(row["task_count"] or 0),
+                "sent_count": int(row["sent_count"] or 0),
+                "pending_count": int(row["pending_count"] or 0),
+                "drafted_count": int(row["drafted_count"] or 0),
+                "failed_count": int(row["failed_count"] or 0),
+            }
+            for row in rows
+        ]
+
+    def create_campaign(self, name: str, note: str = "") -> int:
+        clean_name = " ".join(str(name or "").strip().split())
+        if not clean_name:
+            raise ValueError("活动/批次名称不能为空")
+        now = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO campaigns(name, note, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (clean_name, str(note or ""), now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def update_campaign(
+        self, campaign_id: int, name: str | None = None, note: str | None = None
+    ) -> None:
+        values: dict[str, object] = {}
+        if name is not None:
+            clean_name = " ".join(str(name).strip().split())
+            if not clean_name:
+                raise ValueError("活动/批次名称不能为空")
+            values["name"] = clean_name
+        if note is not None:
+            values["note"] = str(note)
+        if not values:
+            return
+        values["updated_at"] = now_iso()
+        sets = ", ".join(f"{key}=?" for key in values)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE campaigns SET {sets} WHERE id=?",
+                (*values.values(), campaign_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("活动/批次不存在")
+
+    def delete_campaign(self, campaign_id: int, move_to: int | None = None) -> int:
+        """Delete a campaign. Tasks are moved to move_to or deleted with it."""
+        with self.connect() as conn:
+            total = int(
+                conn.execute("SELECT COUNT(*) AS n FROM campaigns").fetchone()["n"]
+            )
+            if total <= 1:
+                raise ValueError("至少保留一个活动/批次")
+            target = conn.execute(
+                "SELECT id FROM campaigns WHERE id=?",
+                (campaign_id,),
+            ).fetchone()
+            if target is None:
+                raise ValueError("活动/批次不存在")
+            if move_to is not None:
+                destination = conn.execute(
+                    "SELECT id FROM campaigns WHERE id=?",
+                    (move_to,),
+                ).fetchone()
+                if destination is None:
+                    raise ValueError("目标活动/批次不存在")
+                affected = int(
+                    conn.execute(
+                        "UPDATE tasks SET campaign_id=? WHERE campaign_id=?",
+                        (move_to, campaign_id),
+                    ).rowcount
+                )
+            else:
+                affected = int(
+                    conn.execute(
+                        "DELETE FROM tasks WHERE campaign_id=?", (campaign_id,)
+                    ).rowcount
+                )
+            conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+            return affected
+
+    def tasks_by_campaign(
+        self,
+        campaign_id: int,
+        statuses: list[str] | None = None,
+        search: str = "",
+    ) -> list[sqlite3.Row]:
+        """Return tasks for one campaign, optionally filtered by status/text."""
+        where = ["campaign_id = ?"]
+        params: list[object] = [campaign_id]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            where.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        keyword = " ".join(str(search or "").strip().split())
+        if keyword:
+            where.append(
+                "(name_override LIKE ? OR first_name LIKE ? OR last_name LIKE ? "
+                "OR location_override LIKE ? OR location LIKE ? "
+                "OR recipient_email LIKE ? OR subject LIKE ?)"
+            )
+            pattern = f"%{keyword}%"
+            params.extend([pattern] * 7)
+        clause = " AND ".join(where)
+        with self.connect() as conn:
+            return conn.execute(
+                f"SELECT * FROM tasks WHERE {clause} ORDER BY id DESC",
+                params,
+            ).fetchall()
+
+    def move_tasks_to_campaign(
+        self, task_ids: list[int], campaign_id: int
+    ) -> int:
+        ids = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+        if not ids:
+            return 0
+        with self.connect() as conn:
+            target = conn.execute(
+                "SELECT id FROM campaigns WHERE id=?", (campaign_id,)
+            ).fetchone()
+            if target is None:
+                raise ValueError("活动/批次不存在")
+            placeholders = ",".join("?" for _ in ids)
+            cursor = conn.execute(
+                f"UPDATE tasks SET campaign_id=? WHERE id IN ({placeholders})",
+                (campaign_id, *ids),
+            )
+            return int(cursor.rowcount)
 
     def backup(self, keep: int = 10) -> Path | None:
         """Snapshot the database into backups/, keeping the newest copies."""
@@ -342,28 +552,32 @@ class Database:
     def update_task(self, task_id: int, **values: object) -> None:
         allowed = {
             "profile_no", "profile_locked", "first_name", "last_name", "location", "location_source",
-            "name_override", "location_override",
+            "name_override", "location_override", "sender_name_override",
             "subject", "body", "gender_label", "gender_source", "source_urls",
             "review_reason", "status", "custom_variables",
-            "generated_at", "drafted_at", "last_error", "attempts",
+            "campaign_id", "generated_at", "drafted_at", "sent_at", "replied_at",
+            "last_error", "attempts",
         }
-        clean = {k: v for k, v in values.items() if k in allowed}
-        if not clean:
+        unknown = sorted(set(values) - allowed)
+        if unknown:
+            raise ValueError(f"不允许更新任务字段：{', '.join(unknown)}")
+        if not values:
             return
-        sets = ", ".join(f"{key}=?" for key in clean)
+        sets = ", ".join(f"{key}=?" for key in values)
         with self.connect() as conn:
-            if "profile_no" in clean:
-                current = conn.execute(
-                    "SELECT profile_no, profile_locked FROM tasks WHERE id=?",
-                    (task_id,),
-                ).fetchone()
+            current = conn.execute(
+                "SELECT profile_no, profile_locked FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if current is None:
+                raise ValueError("任务不存在")
+            if "profile_no" in values:
                 if (
-                    current is not None
-                    and int(current["profile_locked"] or 0) == 1
-                    and int(clean["profile_no"] or 0) != int(current["profile_no"] or 0)
+                    int(current["profile_locked"] or 0) == 1
+                    and int(values["profile_no"] or 0) != int(current["profile_no"] or 0)
                 ):
                     raise ValueError("该任务的窗口编号已锁定，只有删除任务才能解除")
-            conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*clean.values(), task_id))
+            conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*values.values(), task_id))
 
     def lock_task_profile(self, task_id: int, profile_no: int) -> int:
         """Set and permanently lock a task's browser profile until deletion."""
@@ -404,14 +618,21 @@ class Database:
             return 0
         status = "replied" if replied else "sent"
         stamp = now_iso()
-        column = "replied_at" if replied else "sent_at"
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as conn:
-            cur = conn.execute(
-                f"UPDATE tasks SET status=?, {column}=? "
-                f"WHERE id IN ({placeholders})",
-                (status, stamp, *ids),
-            )
+            if replied:
+                cur = conn.execute(
+                    "UPDATE tasks SET status=?, replied_at=?, "
+                    "sent_at=COALESCE(sent_at, ?) "
+                    f"WHERE id IN ({placeholders})",
+                    (status, stamp, stamp, *ids),
+                )
+            else:
+                cur = conn.execute(
+                    f"UPDATE tasks SET status=?, sent_at=? "
+                    f"WHERE id IN ({placeholders})",
+                    (status, stamp, *ids),
+                )
             return int(cur.rowcount)
 
     def unmark_sent(self, task_ids: list[int]) -> int:
@@ -422,7 +643,9 @@ class Database:
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as conn:
             cur = conn.execute(
-                "UPDATE tasks SET status='drafted', sent_at=NULL, replied_at=NULL, "
+                "UPDATE tasks SET status=CASE "
+                "WHEN drafted_at IS NULL THEN 'ready' ELSE 'drafted' END, "
+                "sent_at=NULL, replied_at=NULL, "
                 f"last_error='' WHERE id IN ({placeholders}) "
                 "AND status IN ('sent', 'replied')",
                 ids,

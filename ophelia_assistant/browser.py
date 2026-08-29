@@ -531,24 +531,61 @@ def verify_draft_fields(
     subject: str,
     body: str,
 ) -> bool:
-    """Re-read the open compose and confirm recipient/subject/body match."""
+    """Re-read the open compose controls and compare full field values."""
+    def _emails(value: str) -> set[str]:
+        return set(re.findall(r"[\w.+-]+@[\w.-]+", str(value or "").casefold()))
+
+    def _norm(value: str) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
     try:
         page = _compose_page(browser) or _gmail_page(browser)
         scope = _compose_scope(page)
-        text = scope.evaluate(
-            "element => element.innerText || element.textContent || ''"
-        )
+        recipient_value = scope.locator(
+            'input[name="to"], textarea[name="to"]'
+        ).last.input_value()
+        subject_value = scope.locator(
+            'input[name="subjectbox"], input[name="subject"]'
+        ).last.input_value()
+        body_value = scope.locator(
+            'div[contenteditable="true"][role="textbox"], '
+            'div[aria-label*="Message Body" i], '
+            'div[aria-label*="邮件正文" i], '
+            'div[aria-label*="郵件正文" i]'
+        ).last.inner_text()
     except (PlaywrightError, BrowserAutomationError):
         return False
-    text = str(text or "")
-    first_recipient = str(recipient or "").split("@")[0].casefold()
-    first_subject = str(subject or "").splitlines()[0].strip().casefold()
-    first_body = str(body or "").splitlines()[0].strip().casefold()
     return (
-        bool(first_recipient and first_recipient in text.casefold())
-        and bool(first_subject and first_subject in text.casefold())
-        and bool(first_body and first_body in text.casefold())
+        bool(recipient_value)
+        and _emails(recipient) == _emails(recipient_value)
+        and _norm(subject_value) == _norm(subject)
+        and _norm(body_value) == _norm(body)
     )
+
+
+def click_gmail_send(
+    browser: Browser,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Click the Gmail compose Send button (opt-in automation)."""
+    page = _compose_page(browser) or _gmail_page(browser)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        check_cancel(cancel_event)
+        try:
+            button = page.locator(
+                'div[role="button"][aria-label^="Send" i], '
+                'div[role="button"][aria-label^="发送" i], '
+                'div[role="button"][aria-label^="送信" i], '
+                'div[role="button"][aria-label="Send" i]'
+            ).last
+            if button.is_visible():
+                button.click()
+                return
+        except PlaywrightError:
+            pass
+        time.sleep(0.3)
+    raise BrowserAutomationError("找不到 Gmail 发送按钮，未自动发送")
 
 
 def wait_for_gmail_send(

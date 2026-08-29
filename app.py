@@ -2,7 +2,6 @@ import ctypes
 import logging
 import sys
 import threading
-from ctypes import wintypes
 
 from ophelia_assistant.ui import main
 
@@ -58,54 +57,52 @@ def _maintain_logs(log_dir) -> None:
         pass
 
 
-def _terminate_other_niuma_instances() -> None:
-    """Windows-only: keep a single NiuMaMail instance by killing the others."""
+_MUTEX_HANDLE = None
+
+
+def _single_instance_guard() -> bool:
+    """Windows-only named mutex; do not kill unrelated processes by name."""
+    global _MUTEX_HANDLE
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
-        return
-    kernel32 = ctypes.windll.kernel32
-    PROCESS_TERMINATE = 0x0001
-    TH32CS_SNAPPROCESS = 0x00000002
-    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_wchar * 260),
-        ]
-
-    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == INVALID_HANDLE_VALUE:
-        return
-    current_pid = kernel32.GetCurrentProcessId()
-    entry = PROCESSENTRY32W()
-    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-    found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-    targets: list[int] = []
-    while found:
-        name = str(entry.szExeFile).lower()
-        if name.startswith("niumamail") and name.endswith(".exe"):
-            if entry.th32ProcessID != current_pid:
-                targets.append(int(entry.th32ProcessID))
-        found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
-    kernel32.CloseHandle(snapshot)
-    for pid in targets:
-        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-        if handle:
-            kernel32.TerminateProcess(handle, 1)
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, "NiuMaMail_SingleInstance")
+        if not handle:
+            return True
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
             kernel32.CloseHandle(handle)
+            return False
+        _MUTEX_HANDLE = handle
+        return True
+    except Exception:
+        return True
+
+
+def main() -> None:
+    if "--legacy-tk" not in sys.argv:
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("PySide6") is not None:
+                from ophelia_assistant.studio.app import run as run_studio
+
+                run_studio()
+                return
+        except Exception as exc:
+            logging.getLogger("niuma-mail").warning(
+                "Qt studio unavailable, falling back to Tkinter: %s", exc
+            )
+    from ophelia_assistant.ui import main as tk_main
+
+    tk_main()
 
 
 if __name__ == "__main__":
     _install_logging()
-    _terminate_other_niuma_instances()
+    if not _single_instance_guard():
+        sys.exit(0)
     if sys.platform == "win32":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NiuMaMail.0.90.0")

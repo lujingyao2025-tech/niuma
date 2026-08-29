@@ -1,3 +1,9 @@
+# THESIS: 牛马邮箱是一张可调度、可追踪、可恢复的发信任务台，拒绝传统后台把功能平铺成菜单与表格。
+# OWN-WORLD: 深海军蓝导航、冷白工作面、信号蓝主动作、绿色完成态与琥珀提醒；组件像签派清单与状态灯。
+# STORY: 用户按导入、配置、执行、完成四段轨迹推进一批联系人，并随时看清任务数量、风险与下一步。
+# FIRST VIEWPORT: 224px 导航固定在左；顶部任务轨迹横贯主区；联系人工作台居中；关键发送动作保持高辨识度。
+# FORM: 任务调度台，候选方向第六项；seed 28f129ba。签名交互是随任务状态点亮的四段发送轨迹。
+# FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
 from __future__ import annotations
 
 import json
@@ -29,6 +35,7 @@ from .config import (
     MAX_CONTACT_ROWS,
     MAX_WINDOW_SEQUENCE,
     Settings,
+    is_newer_version,
     next_custom_variable_key,
     normalize_window_sequence,
     resolve_task_windows,
@@ -58,39 +65,40 @@ SYSTEM_VARIABLES = (
     ("location", "城市或城市地区"),
     ("sender_name", "发件人姓名"),
 )
-INK = "#0F172A"
-MUTED = "#5B6B83"
+INK = "#111827"
+MUTED = "#667085"
 PAPER = "#FFFFFF"
-PANEL = "#EEF3FA"
-LINE = "#E3EAF3"
-GOLD = "#2563EB"
-GOLD_DARK = "#1E40AF"
+PANEL = "#F3F6FA"
+LINE = "#DCE3EC"
+GOLD = "#2F6BFF"
+GOLD_DARK = "#1E4FD6"
 RED = "#EF4444"
 GREEN = "#10B981"
-HEADER = "#0B1526"
-SIDEBAR = "#0B1526"
-SIDEBAR_HOVER = "#12203A"
-SURFACE = "#F8FAFD"
+HEADER = "#0B1220"
+SIDEBAR = "#0B1220"
+SIDEBAR_HOVER = "#17243A"
+SURFACE = "#F8FAFC"
 AMBER = "#F59E0B"
 SKY = "#0EA5E9"
 APP_VERSION = f"v{__version__}"
+DISPLAY_FONT = "Bahnschrift SemiCondensed"
 
 
 DEFAULT_THEMES: dict[str, dict[str, str]] = {
     "light": {
-        "ink": "#101827",
-        "muted": "#5C6B84",
+        "ink": "#111827",
+        "muted": "#667085",
         "paper": "#FFFFFF",
-        "panel": "#EFF3F8",
-        "line": "#E1E8F1",
-        "gold": "#2563EB",
-        "gold_dark": "#1E40AF",
+        "panel": "#F3F6FA",
+        "line": "#DCE3EC",
+        "gold": "#2F6BFF",
+        "gold_dark": "#1E4FD6",
         "red": "#EF4444",
         "green": "#16A34A",
-        "header": "#16233F",
-        "sidebar": "#16233F",
-        "sidebar_hover": "#1F2F52",
-        "surface": "#F7F9FC",
+        "header": "#0B1220",
+        "sidebar": "#0B1220",
+        "sidebar_hover": "#17243A",
+        "surface": "#F8FAFC",
         "amber": "#F59E0B",
         "sky": "#0EA5E9",
     },
@@ -224,8 +232,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{tr('牛马邮箱')} · {APP_VERSION}")
-        self.geometry("1280x820")
-        self.minsize(1080, 700)
+        self.geometry("1360x860")
+        self.minsize(1120, 720)
         self.configure(bg=PANEL)
 
         self._resize_job = None
@@ -432,12 +440,12 @@ class App(tk.Tk):
         style.theme_use("clam")
         style.layout("Sidebar.TNotebook.Tab", [])
         style.configure("Sidebar.TNotebook", background=PANEL, borderwidth=0, tabmargins=0)
-        style.configure("App.TNotebook", background=PANEL, borderwidth=0, tabmargins=(8, 8, 8, 0))
+        style.configure("App.TNotebook", background=PANEL, borderwidth=0, tabmargins=(12, 10, 12, 0))
         style.configure(
             "App.TNotebook.Tab",
-            background="#E8EFFA",
+            background="#E9EEF5",
             foreground=MUTED,
-            padding=(24, 12),
+            padding=(22, 11),
             font=("Microsoft YaHei UI", 10, "bold"),
             borderwidth=0,
         )
@@ -447,25 +455,25 @@ class App(tk.Tk):
             background=PAPER,
             fieldbackground=PAPER,
             foreground=INK,
-            rowheight=38,
+            rowheight=42,
             borderwidth=0,
             font=("Microsoft YaHei UI", 9),
         )
         style.configure(
             "App.Treeview.Heading",
-            background="#E8EFFA",
+            background="#EDF1F6",
             foreground=INK,
             relief="flat",
             padding=(10, 10),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
-        style.map("App.Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", INK)])
-        style.configure("Primary.TButton", background=GOLD, foreground="#FFFFFF", padding=(18, 10), borderwidth=1, bordercolor=GOLD, font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("App.Treeview", background=[("selected", "#E8EFFF")], foreground=[("selected", INK)])
+        style.configure("Primary.TButton", background=GOLD, foreground="#FFFFFF", padding=(18, 11), borderwidth=0, bordercolor=GOLD, font=("Microsoft YaHei UI", 9, "bold"))
         style.map("Primary.TButton", background=[("active", GOLD_DARK), ("pressed", GOLD_DARK)])
         style.configure("Danger.TButton", background=RED, foreground="#FFFFFF", padding=(16, 10), borderwidth=1, bordercolor=RED, font=("Microsoft YaHei UI", 9, "bold"))
         style.map("Danger.TButton", background=[("active", "#B91C1C")])
-        style.configure("Soft.TButton", background="#FFFFFF", foreground=INK, padding=(14, 10), borderwidth=1, bordercolor=LINE, font=("Microsoft YaHei UI", 9))
-        style.map("Soft.TButton", background=[("active", "#E2E8F0")])
+        style.configure("Soft.TButton", background="#FFFFFF", foreground=INK, padding=(14, 10), borderwidth=1, bordercolor=LINE, font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Soft.TButton", background=[("active", "#EEF2F7")])
         style.configure("App.TEntry", fieldbackground="#FFFFFF", bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, padding=9)
         style.configure("App.TSpinbox", fieldbackground="#FFFFFF", bordercolor=LINE, padding=8)
         style.configure(
@@ -562,11 +570,11 @@ class App(tk.Tk):
         )
         self.shell_body = tk.Frame(self.shell, bg=PANEL)
         self.shell_body.pack(fill="both", expand=True)
-        sidebar = tk.Frame(self.shell_body, bg=SIDEBAR, width=208)
+        sidebar = tk.Frame(self.shell_body, bg=SIDEBAR, width=224)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
         brand_box = tk.Frame(sidebar, bg=SIDEBAR)
-        brand_box.pack(fill="x", padx=16, pady=(18, 12))
+        brand_box.pack(fill="x", padx=18, pady=(22, 18))
         brand_row = tk.Frame(brand_box, bg=SIDEBAR)
         brand_row.pack(anchor="w")
         if self._header_icon:
@@ -577,15 +585,15 @@ class App(tk.Tk):
         title_box.pack(side="left")
         tk.Label(
             title_box, text=tr("牛马邮箱"), bg=SIDEBAR, fg="#FFFFFF",
-            font=("Microsoft YaHei UI", 15, "bold"),
+            font=(DISPLAY_FONT, 17, "bold"),
         ).pack(anchor="w")
         tk.Label(
             title_box, text=APP_VERSION, bg=SIDEBAR, fg="#7DB3FF",
             font=("Segoe UI", 8, "bold"),
         ).pack(anchor="w")
         tk.Label(
-            brand_box, text=tr("跨境邮件自动化助手"), bg=SIDEBAR, fg="#93A4C0",
-            font=("Microsoft YaHei UI", 8),
+            brand_box, text=tr("外贸发信任务调度台"), bg=SIDEBAR, fg="#9DABC0",
+            font=("Microsoft YaHei UI", 9),
         ).pack(anchor="w", pady=(8, 0))
         tk.Frame(brand_box, bg="#1E2A44", height=1).pack(fill="x", pady=(12, 0))
         content = tk.Frame(self.shell_body, bg=PANEL)
@@ -605,12 +613,16 @@ class App(tk.Tk):
         self.notebook.add(self.template_tab, text=tr("邮件模板"))
         self.notebook.add(self.settings_tab, text=tr("设置"))
         self._nav_buttons: dict[tk.Frame, tk.Button] = {}
+        tk.Label(
+            sidebar, text=tr("任务流程"), bg=SIDEBAR, fg="#66758B",
+            font=("Microsoft YaHei UI", 8, "bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(2, 6))
         nav_specs = [
-            (self.queue_tab, tr("案牍工作台")),
-            (self.batch_tab, tr("录入名帖")),
-            (self.window_tab, tr("窗口阵列")),
-            (self.history_tab, tr("往来旧册")),
-            (self.template_tab, tr("尺牍模板")),
+            (self.queue_tab, tr("任务调度台")),
+            (self.batch_tab, tr("导入联系人")),
+            (self.template_tab, tr("邮件模板")),
+            (self.window_tab, tr("发信窗口")),
+            (self.history_tab, tr("发送记录")),
             (self.settings_tab, tr("系统设置")),
         ]
         for page, title in nav_specs:
@@ -618,10 +630,10 @@ class App(tk.Tk):
                 sidebar, text=title, command=lambda target=page: self._select_page(target),
                 bg=SIDEBAR, fg="#FFFFFF", activebackground=SIDEBAR_HOVER,
                 activeforeground="#FFFFFF", relief="flat", bd=0, anchor="w",
-                padx=16, pady=9, font=("Microsoft YaHei UI", 10, "bold"),
+                padx=18, pady=11, font=("Microsoft YaHei UI", 10, "bold"),
                 cursor="hand2",
             )
-            button.pack(fill="x", padx=8, pady=2)
+            button.pack(fill="x", padx=10, pady=2)
             self._nav_buttons[page] = button
         sidebar_footer = tk.Frame(sidebar, bg=SIDEBAR)
         sidebar_footer.pack(side="bottom", fill="x", padx=16, pady=14)
@@ -633,7 +645,7 @@ class App(tk.Tk):
             sidebar_footer, textvariable=self.connection_var, bg=SIDEBAR, fg="#7DB3FF",
             font=("Microsoft YaHei UI", 8, "bold"),
         ).pack(anchor="w", pady=(0, 8))
-        tk.Label(sidebar_footer, text=tr("多窗口 · 批量触达 · 自动填写"), bg=SIDEBAR, fg="#94A3B8", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        tk.Label(sidebar_footer, text=tr("本地处理 · 人工确认发送"), bg=SIDEBAR, fg="#94A3B8", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
         tk.Label(sidebar_footer, text=APP_VERSION, bg=SIDEBAR, fg="#94A3B8", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 0))
         self._build_queue()
         self._build_batch_import()
@@ -644,7 +656,7 @@ class App(tk.Tk):
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self._sync_nav())
         self._sync_nav()
         self.status_var = tk.StringVar(value="准备就绪")
-        status = tk.Label(self.shell, textvariable=self.status_var, bg="#E8EFFA", fg=MUTED, anchor="w", padx=16, pady=8, font=("Microsoft YaHei UI", 9))
+        status = tk.Label(self.shell, textvariable=self.status_var, bg="#E9EEF5", fg=MUTED, anchor="w", padx=18, pady=9, font=("Microsoft YaHei UI", 9))
         status.pack(fill="x", side="bottom")
 
     def _select_page(self, page) -> None:
@@ -666,7 +678,7 @@ class App(tk.Tk):
         for page, button in self._nav_buttons.items():
             active = page is selected
             button.configure(
-                bg=GOLD_DARK if active else SIDEBAR,
+                bg=GOLD if active else SIDEBAR,
                 activebackground=GOLD_DARK if active else SIDEBAR_HOVER,
             )
         if hasattr(self, "history_tab") and selected is self.history_tab:
@@ -738,17 +750,28 @@ class App(tk.Tk):
 
     def _build_queue(self) -> None:
         self.queue_tab.grid_columnconfigure(0, weight=1)
-        self.queue_tab.grid_rowconfigure(4, weight=1)
+        self.queue_tab.grid_rowconfigure(2, weight=1)
         self.task_filter = "active"
 
-        switcher = self._card(self.queue_tab, row=0, column=0, sticky="ew", padx=19, pady=(12, 4))
+        switcher = self._card(self.queue_tab, row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
+        mission = tk.Frame(switcher, bg=PAPER)
+        mission.pack(fill="x", padx=18, pady=(14, 8))
+        mission_copy = tk.Frame(mission, bg=PAPER)
+        mission_copy.pack(side="left")
         tk.Label(
-            switcher,
-            text="窗口应用",
-            bg=PAPER,
-            fg=INK,
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="left", padx=(14, 10), pady=8)
+            mission_copy, text=tr("本轮发信任务"), bg=PAPER, fg=INK,
+            font=(DISPLAY_FONT, 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            mission_copy, text=tr("按流程准备联系人、生成内容并填写 Gmail 草稿"),
+            bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", pady=(3, 0))
+        provider = tk.Frame(mission, bg=PAPER)
+        provider.pack(side="right")
+        tk.Label(
+            provider, text=tr("发信窗口"), bg=PAPER, fg=MUTED,
+            font=("Microsoft YaHei UI", 8, "bold"),
+        ).pack(side="left", padx=(0, 8))
         provider_name = BROWSER_PROVIDER_NAMES.get(
             self.settings.browser_provider,
             BROWSER_PROVIDER_NAMES["morelogin"],
@@ -756,16 +779,16 @@ class App(tk.Tk):
         self.browser_provider_var = tk.StringVar(value=provider_name)
         for name in BROWSER_PROVIDER_NAMES.values():
             tk.Radiobutton(
-                switcher,
+                provider,
                 text=name,
                 value=name,
                 variable=self.browser_provider_var,
                 command=self.switch_browser_provider,
                 indicatoron=False,
-                bg="#F1F5F9",
+                bg="#EDF1F6",
                 fg=INK,
-                selectcolor="#DBEAFE",
-                activebackground="#DBEAFE",
+                selectcolor="#E8EFFF",
+                activebackground="#E8EFFF",
                 activeforeground=INK,
                 relief="flat",
                 bd=0,
@@ -773,25 +796,60 @@ class App(tk.Tk):
                 pady=6,
                 cursor="hand2",
                 font=("Microsoft YaHei UI", 8, "bold"),
-            ).pack(side="left", padx=3, pady=6)
+            ).pack(side="left", padx=2)
         self.test_connection_button = ttk.Button(
-            switcher,
+            provider,
             text=tr("测试当前连接"),
             style="Soft.TButton",
             command=self.test_browser_connection,
         )
-        self.test_connection_button.pack(side="right", padx=10, pady=5)
+        self.test_connection_button.pack(side="left", padx=(8, 0))
+
+        route = tk.Frame(switcher, bg="#F7F9FC")
+        route.pack(fill="x", padx=1, pady=(0, 1))
+        route_inner = tk.Frame(route, bg="#F7F9FC")
+        route_inner.pack(fill="x", padx=18, pady=10)
+        route_steps = [
+            ("1", tr("导入联系人"), tr("已就绪"), self.batch_tab),
+            ("2", tr("配置模板"), tr("已就绪"), self.template_tab),
+            ("3", tr("生成并填写"), tr("当前步骤"), self.queue_tab),
+            ("4", tr("确认结果"), tr("待开始"), self.history_tab),
+        ]
+        for index, (number, label, state, target) in enumerate(route_steps):
+            step = tk.Frame(route_inner, bg="#F7F9FC", cursor="hand2")
+            step.pack(side="left", fill="x", expand=True)
+            dot_color = GOLD if index == 2 else (GREEN if index < 2 else "#CBD5E1")
+            dot = tk.Label(
+                step, text=number, bg=dot_color, fg="#FFFFFF",
+                width=2, pady=3, font=("Segoe UI", 8, "bold"), cursor="hand2",
+            )
+            dot.pack(side="left")
+            copy = tk.Frame(step, bg="#F7F9FC", cursor="hand2")
+            copy.pack(side="left", padx=(8, 0))
+            name = tk.Label(copy, text=label, bg="#F7F9FC", fg=INK if index <= 2 else MUTED,
+                            font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2")
+            name.pack(anchor="w")
+            state_label = tk.Label(copy, text=state, bg="#F7F9FC",
+                                   fg=GREEN if index < 2 else (GOLD if index == 2 else MUTED),
+                                   font=("Microsoft YaHei UI", 7), cursor="hand2")
+            state_label.pack(anchor="w")
+            for widget in (step, dot, copy, name, state_label):
+                widget.bind("<Button-1>", lambda _event, page=target: self._select_page(page))
+            if index < len(route_steps) - 1:
+                tk.Frame(route_inner, bg=dot_color, height=2, width=32).pack(
+                    side="left", padx=10
+                )
 
         stats = tk.Frame(self.queue_tab, bg=PANEL)
-        stats.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 6))
+        stats.grid(row=1, column=0, sticky="ew", padx=15, pady=(6, 7))
         for i in range(4):
             stats.grid_columnconfigure(i, weight=1)
         self.stat_vars = {key: tk.StringVar(value="0") for key in ("all", "new", "ready", "drafted")}
         stat_specs = [
-            ("all", tr("全部任务"), GOLD),
-            ("new", tr("未生成"), "#94A3B8"),
-            ("ready", tr("待确认"), GREEN),
-            ("drafted", tr("Gmail 草稿"), "#0EA5E9"),
+            ("all", tr("本轮任务"), GOLD),
+            ("new", tr("等待生成"), "#94A3B8"),
+            ("ready", tr("等待确认"), AMBER),
+            ("drafted", tr("草稿已填写"), GREEN),
         ]
         for idx, (key, label, color) in enumerate(stat_specs):
             card = self._card(stats, row=0, column=idx, sticky="ew", padx=5)
@@ -799,13 +857,16 @@ class App(tk.Tk):
             accent.pack(side="left", fill="y")
             body = tk.Frame(card, bg=PAPER)
             body.pack(side="left", padx=14, pady=9)
-            count_label = tk.Label(body, textvariable=self.stat_vars[key], bg=PAPER, fg=INK, font=("Segoe UI", 18, "bold"))
+            count_label = tk.Label(body, textvariable=self.stat_vars[key], bg=PAPER, fg=INK, font=(DISPLAY_FONT, 19, "bold"))
             count_label.pack(anchor="w")
             name_label = tk.Label(body, text=label, bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8))
             name_label.pack(anchor="w")
             for widget in (card, accent, body, count_label, name_label):
                 widget.configure(cursor="hand2")
                 widget.bind("<Button-1>", lambda _event, value=key: self._set_task_filter(value))
+        # Counts remain live for the persistent dispatch summary; the legacy
+        # metric strip is intentionally hidden to keep one operational spine.
+        stats.grid_remove()
 
         actions_shell = tk.Frame(self.queue_tab, bg=PANEL)
         actions_shell.grid(row=2, column=0, sticky="ew", padx=19, pady=5)
@@ -886,15 +947,36 @@ class App(tk.Tk):
             ]
         )
         _bind_actions_wheel(actions)
+        # Recovery commands stay instantiated for operation-state management,
+        # but are surfaced contextually through the compact menu below.
+        actions_shell.grid_remove()
 
         filters = tk.Frame(self.queue_tab, bg=PANEL)
-        filters.grid(row=3, column=0, sticky="ew", padx=19, pady=(0, 5))
+        filters.grid(row=1, column=0, sticky="ew", padx=20, pady=(10, 7))
         self.selection_count_var = tk.StringVar(value=trf("已选择 {count} 条", count=0))
         tk.Label(filters, textvariable=self.selection_count_var, bg=PANEL, fg=INK, font=("Microsoft YaHei UI", 8, "bold")).pack(side="left")
         self.select_all_button = ttk.Button(filters, text=tr("全选当前结果"), style="Soft.TButton", command=self.select_all_queue_tasks)
         self.select_all_button.pack(side="left", padx=8)
         self._operation_buttons.append(self.select_all_button)
         ttk.Button(filters, text=tr("刷新"), style="Soft.TButton", command=self.refresh).pack(side="right")
+        more_actions = tk.Menubutton(
+            filters, text=tr("更多操作"), bg=PAPER, fg=INK,
+            activebackground="#EEF2F7", activeforeground=INK,
+            relief="solid", bd=1, padx=12, pady=8,
+            font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2",
+        )
+        more_menu = tk.Menu(more_actions, tearoff=False)
+        more_menu.add_command(label=tr("生成全部待处理任务"), command=self.generate_ungenerated_tasks)
+        more_menu.add_command(label=tr("填写并跟踪发送"), command=lambda: self.open_selected_drafts(True))
+        more_menu.add_separator()
+        more_menu.add_command(label=tr("重试失败草稿"), command=self.retry_failed_drafts)
+        more_menu.add_command(label=tr("停止当前任务"), command=self.cancel_current_operation)
+        more_menu.add_separator()
+        more_menu.add_command(label=tr("标记已发送"), command=self.mark_selected_sent)
+        more_menu.add_command(label=tr("撤销发送标记"), command=self.unmark_selected_sent)
+        more_menu.add_command(label=tr("删除所选任务"), command=self.delete_selected_queue_tasks)
+        more_actions.configure(menu=more_menu)
+        more_actions.pack(side="right", padx=(8, 0))
         ttk.Button(filters, text=tr("今日统计"), style="Soft.TButton", command=self.show_daily_stats).pack(side="right", padx=(8, 0))
         ttk.Button(filters, text=tr("窗口状态"), style="Soft.TButton", command=self.show_window_status).pack(side="right", padx=(8, 0))
         self.task_search_var = tk.StringVar()
@@ -904,11 +986,22 @@ class App(tk.Tk):
         tk.Label(filters, text=tr("搜索姓名 / 城市 / 邮箱"), bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(side="right")
 
         split = tk.PanedWindow(self.queue_tab, orient="horizontal", bg=PANEL, bd=0, sashwidth=8, sashrelief="flat")
-        split.grid(row=4, column=0, sticky="nsew", padx=19, pady=(2, 12))
+        split.grid(row=2, column=0, sticky="nsew", padx=20, pady=(2, 14))
         table_card = self._card(split)
         preview_card = self._card(split)
         split.add(table_card, minsize=650, stretch="always")
         split.add(preview_card, minsize=310, stretch="always")
+
+        table_heading = tk.Frame(table_card, bg=PAPER)
+        table_heading.pack(fill="x", padx=14, pady=(12, 10))
+        heading_copy = tk.Frame(table_heading, bg=PAPER)
+        heading_copy.pack(side="left")
+        tk.Label(heading_copy, text=tr("联系人任务清单"), bg=PAPER, fg=INK,
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        tk.Label(heading_copy, text=tr("还没有任务时，请先导入 XLSX / CSV，或手动录入联系人"),
+                 bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(2, 0))
+        ttk.Button(table_heading, text=tr("导入或录入联系人"), style="Primary.TButton",
+                   command=lambda: self._select_page(self.batch_tab)).pack(side="right")
 
         columns = ("id", "profile", "name", "location", "email", "status")
         self.tree = ttk.Treeview(table_card, columns=columns, show="headings", style="App.Treeview", selectmode="extended")
@@ -926,7 +1019,37 @@ class App(tk.Tk):
         self.tree.bind("<Delete>", lambda _event: self.delete_selected_queue_tasks())
         self.tree.bind("<Control-a>", self._select_all_shortcut)
 
-        tk.Label(preview_card, text=tr("邮件预览"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=14, pady=(12, 2))
+        dispatch = tk.Frame(preview_card, bg="#0F1C31")
+        dispatch.pack(fill="x", padx=1, pady=(1, 10))
+        tk.Label(dispatch, text=tr("发送签派摘要"), bg="#0F1C31", fg="#FFFFFF",
+                 font=(DISPLAY_FONT, 14, "bold")).pack(anchor="w", padx=14, pady=(14, 2))
+        tk.Label(dispatch, textvariable=self.selection_count_var, bg="#0F1C31", fg="#9FB6D8",
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 10))
+        checklist = tk.Frame(dispatch, bg="#0F1C31")
+        checklist.pack(fill="x", padx=14)
+        dispatch_rows = [
+            (tr("联系人已导入"), self.stat_vars["all"], GREEN),
+            (tr("等待生成内容"), self.stat_vars["new"], "#94A3B8"),
+            (tr("等待人工确认"), self.stat_vars["ready"], AMBER),
+            (tr("Gmail 草稿就绪"), self.stat_vars["drafted"], SKY),
+        ]
+        for label, value_var, color in dispatch_rows:
+            row = tk.Frame(checklist, bg="#0F1C31")
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text="●", bg="#0F1C31", fg=color,
+                     font=("Segoe UI", 8)).pack(side="left")
+            tk.Label(row, text=label, bg="#0F1C31", fg="#DCE6F4",
+                     font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(7, 0))
+            tk.Label(row, textvariable=value_var, bg="#0F1C31", fg="#FFFFFF",
+                     font=("Segoe UI", 9, "bold")).pack(side="right")
+        dispatch_actions = tk.Frame(dispatch, bg="#0F1C31")
+        dispatch_actions.pack(fill="x", padx=14, pady=(12, 14))
+        ttk.Button(dispatch_actions, text=tr("生成所选内容"), style="Primary.TButton",
+                   command=self.generate_selected_tasks).pack(fill="x")
+        ttk.Button(dispatch_actions, text=tr("填写 Gmail 草稿"), style="Soft.TButton",
+                   command=lambda: self.open_selected_drafts(False)).pack(fill="x", pady=(6, 0))
+
+        tk.Label(preview_card, text=tr("邮件预览"), bg=PAPER, fg=INK, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=14, pady=(2, 2))
         tk.Label(preview_card, text=tr("发送前请在 Gmail 中逐封核对"), bg=PAPER, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 8))
         self.preview = tk.Text(preview_card, wrap="word", state="disabled", bg="#FFFFFF", fg=INK, relief="flat", highlightthickness=1, highlightbackground=LINE, padx=12, pady=12, font=("Microsoft YaHei UI", 9), spacing1=2, spacing3=4)
         self.preview.pack(fill="both", expand=True, padx=12, pady=(0, 6))
@@ -4700,8 +4823,18 @@ class App(tk.Tk):
                 remote_version = str(payload.get("version") or "").strip().lstrip("v")
                 download_url = str(payload.get("url") or "")
                 current_version = str(__version__).lstrip("v")
+                from .update_security import verify_update_payload
+
+                valid_manifest, manifest_reason = verify_update_payload(payload)
+                if not valid_manifest:
+                    self._set_status("检查更新失败")
+                    messagebox.showerror(
+                        "检查更新失败",
+                        f"更新清单校验失败：{manifest_reason}",
+                    )
+                    return
                 self._set_status("检查更新完成")
-                if remote_version and remote_version > current_version:
+                if is_newer_version(remote_version, current_version):
                     if not messagebox.askyesno(
                         "发现新版本",
                         f"发现新版本：v{remote_version}\n当前版本：v{current_version}\n\n"
@@ -4725,9 +4858,28 @@ class App(tk.Tk):
                             )
                         else:
                             target = Path(tempfile.gettempdir()) / f"NiuMaMail-v{remote_version}.exe"
+                        import hashlib
+
+                        digest = hashlib.sha256()
                         with open(target, "wb") as handle:
                             for chunk in response.iter_content(chunk_size=1 << 16):
                                 handle.write(chunk)
+                                digest.update(chunk)
+                        expected_sha256 = str(payload.get("sha256") or "").lower()
+                        if (
+                            not expected_sha256
+                            or digest.hexdigest().lower() != expected_sha256
+                        ):
+                            try:
+                                target.unlink()
+                            except OSError:
+                                pass
+                            self._set_status("下载失败：SHA-256 校验未通过")
+                            messagebox.showerror(
+                                "下载失败",
+                                "下载文件 SHA-256 校验失败，已取消安装",
+                            )
+                            return
                     except Exception as exc:
                         self._set_status(f"下载失败：{exc}")
                         messagebox.showerror("下载失败", str(exc))

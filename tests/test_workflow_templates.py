@@ -1,5 +1,6 @@
 import unittest
 import sqlite3
+import threading
 
 from ophelia_assistant.config import Settings, resolve_task_windows_balanced
 from ophelia_assistant.workflow import Workflow
@@ -100,6 +101,25 @@ class WorkflowTemplateBindingTests(unittest.TestCase):
         conn.close()
         _subject, body = workflow._render_email_for_task(row, "Alex", "Seattle", {})
         self.assertIn("行发件人", body)
+
+    def test_generate_local_does_not_store_cancel_event_as_sender(self) -> None:
+        task = self._task()
+
+        class FakeDatabase:
+            def __init__(self):
+                self.values = None
+
+            def get_task(self, _task_id):
+                return task
+
+            def update_task(self, _task_id, **values):
+                self.values = values
+
+        database = FakeDatabase()
+        workflow = Workflow(db=database, settings=Settings())
+        workflow.generate_local(1, threading.Event())
+        self.assertEqual(database.values["sender_name_override"], "")
+        self.assertEqual(database.values["status"], "ready")
 
 
 class BalancedWindowAssignmentTests(unittest.TestCase):

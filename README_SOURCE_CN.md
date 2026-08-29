@@ -5,6 +5,7 @@
 ## 当前主要功能
 
 - 手动录入或从 Excel 导入姓名、地区、邮箱和自定义变量，最多100条。
+- 以“活动/批次”组织联系人，每个活动独立管理联系人、模板、窗口和草稿。
 - 本地生成邮件标题和正文，不调用外部 AI 接口。
 - 支持 MoreLogin、AdsPower Browser、BitBrowser Global。
 - 窗口顺序支持动态添加、单项删除和全部清空，最多30个窗口。
@@ -14,6 +15,8 @@
 - 支持模板库、自定义变量、签名以及按浏览器窗口绑定发件人和模板。
 - 支持任务历史、失败记录、数据库备份与恢复。
 - 支持中英文界面、深浅色模式和自定义皮肤。
+- 默认使用 PySide6 “外贸邮件工作室”界面：56px 功能轨、活动列表、工作区页签和右侧检查器。
+- 支持 Ctrl+K 命令面板与键盘优先操作；旧 Tkinter 界面可用 `--legacy-tk` 启动。
 - 默认发件人姓名为 Anna Lee，用户可以在设置中修改。
 - 首次免费使用3天；支持设备绑定的管理员验证码授权。
 
@@ -21,6 +24,7 @@
 
 - `app.py`：程序入口。
 - `ophelia_assistant/ui.py`：Tkinter 用户界面。
+- `ophelia_assistant/studio/`：PySide6 外贸邮件工作室界面。
 - `ophelia_assistant/config.py`：设置、模板和窗口顺序规则。
 - `ophelia_assistant/trial.py`：3天试用与用户端验证码校验。
 - `ophelia_assistant/morelogin.py`：三种浏览器窗口接口。
