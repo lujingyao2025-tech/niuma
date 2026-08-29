@@ -1,4 +1,4 @@
-# 牛马邮箱 v0.90.0 用户端源码
+# 牛马邮箱 v0.91.0 用户端源码
 
 这是牛马邮箱 Windows 用户端的完整 Python 源码，不包含管理员验证码生成器及管理员私钥。
 
@@ -47,7 +47,7 @@ py -3.12 -m venv .venv
 
 也可以直接双击 `RUN_SOURCE.bat` 创建环境并启动。
 
-`requirements.txt` 记录直接依赖的兼容范围，`requirements-lock.txt` 锁定 v0.90.0 验证过的完整依赖集。源码运行和 EXE 构建脚本默认使用锁定文件，以便重现同一环境。
+`requirements.txt` 记录直接依赖的兼容范围，`requirements-lock.txt` 锁定 v0.91.0 验证过的完整依赖集。源码运行和 EXE 构建脚本默认使用锁定文件，以便重现同一环境。
 
 ## 运行测试
 
@@ -60,7 +60,7 @@ py -3.12 -m venv .venv
 双击 `BUILD_WINDOWS_EXE.bat`。构建完成后文件位于：
 
 ```text
-dist\NiuMaMail-v0.90.0.exe
+dist\NiuMaMail-v0.91.0.exe
 ```
 
 PyInstaller 生成的是免安装 EXE。正式安装包仍可使用 NSIS 或其他 Windows 安装工具封装。

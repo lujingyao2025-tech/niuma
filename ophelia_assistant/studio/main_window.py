@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -13,8 +14,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThreadPool
-from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -34,6 +42,8 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..batch import assign_windows, group_tasks_by_window
 from ..config import (
+    BATCH_GENERATE_LIMIT,
+    BATCH_IMPORT_LIMIT,
     BATCH_DRAFT_INTERVAL_SECONDS,
     MAX_CONCURRENT_TASKS,
     MAX_GENERATE_TASKS,
@@ -60,6 +70,7 @@ from .pages import (
     TemplatesPage,
 )
 from .theme import STATUS_COLORS, build_qss, palette_for
+from .ui_state import UiStateStore
 from .widgets import (
     CommandPalette,
     ContactPromptDialog,
@@ -72,6 +83,20 @@ from .workers import FunctionWorker, WorkerSignals
 
 
 logger = logging.getLogger("niuma-mail")
+
+
+def global_chunk_percent(
+    base_done: int,
+    chunk_size: int,
+    total: int,
+    local_percent: int,
+) -> int:
+    """Map one chunk's 0-100 progress into the whole batch's 0-100 progress."""
+    if total <= 0:
+        return 100
+    local_done = max(0, min(100, int(local_percent))) * max(0, chunk_size) / 100
+    done = max(0, base_done) + local_done
+    return int(done * 100 / total)
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +112,7 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool(self)
         self.thread_pool.setMaxThreadCount(4)
         self.settings_store = QSettings("NiuMaMail", "Studio")
+        self.ui_state = UiStateStore(self)
         self._busy = False
         self._licensed = bool(self.trial_status.active)
         self._closing = False
@@ -109,6 +135,9 @@ class MainWindow(QMainWindow):
         geometry = self.settings_store.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
+        last_page = self.ui_state.value("last_page", 0, type=int)
+        if 0 <= int(last_page) < self.stack.count():
+            self.switch_page(int(last_page))
         last_campaign = self.settings_store.value("last_campaign_id", type=int)
         if last_campaign:
             campaign_ids = {int(item["id"]) for item in self._campaigns}
@@ -227,6 +256,7 @@ class MainWindow(QMainWindow):
         self._current_page = index
         self.stack.setCurrentIndex(index)
         self._sync_rail()
+        self.ui_state.setValue("last_page", index)
         if index == 2:
             self.pages[2].reload()
         if index == 4:
@@ -260,9 +290,16 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_license_label(self) -> None:
+        suffix = (
+            tr("本地模式")
+            if self._licensed
+            else tr("功能已锁定")
+        )
+        if getattr(self.trial_status, "suspicious", False):
+            suffix = tr("授权异常，请核对")
         self.license_label.setText(
             f"{tr(remaining_text(self.trial_status))} · "
-            f"{tr('本地模式') if self._licensed else tr('功能已锁定')}"
+            f"{suffix}"
         )
 
     def apply_license_state(self) -> None:
@@ -495,6 +532,11 @@ class MainWindow(QMainWindow):
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         entries = dialog.entries
+        if len(entries) > BATCH_IMPORT_LIMIT:
+            self.set_status(
+                tr("已选择 {count} 条联系人，将按每批 {limit} 条分批导入")
+                .format(count=len(entries), limit=BATCH_IMPORT_LIMIT)
+            )
         contacts = [
             (entry.get("name", ""), entry.get("location", ""), entry.get("email", ""))
             for entry in entries
@@ -507,11 +549,15 @@ class MainWindow(QMainWindow):
             }
             for entry in entries
         ]
-        task_ids = self.db.add_local_tasks(
-            contacts,
-            custom_list,
-            campaign_id=dialog.selected_campaign_id,
-        )
+        task_ids: list[int | None] = []
+        for index in range(0, len(contacts), BATCH_IMPORT_LIMIT):
+            task_ids.extend(
+                self.db.add_local_tasks(
+                    contacts[index:index + BATCH_IMPORT_LIMIT],
+                    custom_list[index:index + BATCH_IMPORT_LIMIT],
+                    campaign_id=dialog.selected_campaign_id,
+                )
+            )
         self.refresh_all()
         self.set_status(tr("已导入 {count} 条联系人").format(count=len(task_ids)))
 
@@ -572,6 +618,9 @@ class MainWindow(QMainWindow):
             return
         row = self.db.get_task(task_ids[0])
         inspector.show_task(dict(row) if row is not None else None)
+        page = self.pages[self._current_page]
+        if hasattr(page, "inspector_auto_show"):
+            page.inspector_auto_show()
 
     def on_task_double_clicked(self, row: dict) -> None:
         subject = str(row.get("subject") or "")
@@ -644,7 +693,11 @@ class MainWindow(QMainWindow):
                 self.operations.finish(cancel_event, serial)
                 self.set_busy(False)
                 self.refresh_all()
-                self.set_status(tr("操作完成"))
+                if self.status_label.text() in (
+                    tr("处理中…"),
+                    tr("操作完成"),
+                ):
+                    self.set_status(tr("操作完成"))
             self._close_progress_dialog()
 
         signals.done.connect(on_done_result)
@@ -704,7 +757,13 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择要生成的联系人。"))
             return
-        ids = self._cap_task_ids(ids)
+        ids = list(dict.fromkeys(int(task_id) for task_id in ids))
+        if len(ids) > MAX_GENERATE_TASKS:
+            self.set_status(
+                tr("一次最多生成 {limit} 封，已截取前 {limit} 封")
+                .format(limit=MAX_GENERATE_TASKS)
+            )
+            ids = ids[:MAX_GENERATE_TASKS]
         self.generate_tasks(ids)
 
     def load_demo_data(self) -> None:
@@ -768,20 +827,74 @@ class MainWindow(QMainWindow):
         if not ids:
             return
         ids = list(dict.fromkeys(ids))[:MAX_GENERATE_TASKS]
-        def run(cancel_event, progress, task_status, task_ids):
-            def worker(ce, pr, task_id):
-                row = self.db.get_task(task_id)
-                email = row["recipient_email"] if row is not None else ""
-                task_status("", email, tr("生成中"), "")
-                return self.workflow.generate_local(task_id, cancel_event=ce)
-
-            return self._run_tasks_parallel(
-                cancel_event,
-                progress,
-                task_ids,
-                worker,
-                task_status=task_status,
+        chunks = [
+            ids[index:index + BATCH_GENERATE_LIMIT]
+            for index in range(0, len(ids), BATCH_GENERATE_LIMIT)
+        ]
+        if len(chunks) > 1:
+            self.set_status(
+                tr("已选择 {count} 封邮件，将按每批 {limit} 封分 {batches} 批处理")
+                .format(
+                    count=len(ids),
+                    limit=BATCH_GENERATE_LIMIT,
+                    batches=len(chunks),
+                )
             )
+
+        def run(cancel_event, progress, task_status, task_ids):
+            workflow = self.workflow
+            total = len(task_ids)
+            progress(0, tr("正在生成 0/{total}").format(total=total))
+            completed = 0
+            success = 0
+            failed = 0
+            for chunk in chunks:
+                check_cancel(cancel_event)
+                base_done = completed
+
+                def chunk_progress(value: int, _text: str) -> None:
+                    percent = global_chunk_percent(
+                        base_done,
+                        len(chunk),
+                        total,
+                        value,
+                    )
+                    done = base_done + int(
+                        max(0, min(100, value)) * len(chunk) / 100
+                    )
+                    progress(
+                        percent,
+                        tr("正在生成 {completed}/{total}").format(
+                            completed=done,
+                            total=total,
+                        ),
+                    )
+
+                chunk_result = workflow.generate_local_batch(
+                    chunk,
+                    cancel_event=cancel_event,
+                    progress=chunk_progress,
+                    task_status=task_status,
+                )
+                completed += chunk_result.get("completed", len(chunk))
+                success += chunk_result.get("success", 0)
+                failed += chunk_result.get("failed", 0)
+                progress(
+                    int(completed * 100 / total) if total else 100,
+                    tr("正在生成 {completed}/{total}：成功 {success} · 失败 {failed}")
+                    .format(
+                        completed=completed,
+                        total=total,
+                        success=success,
+                        failed=failed,
+                    ),
+                )
+            return {
+                "completed": completed,
+                "sent": 0,
+                "failed": failed,
+                "needs_review": 0,
+            }
 
         def done(result):
             count = (result or {}).get("completed", 0)
@@ -796,7 +909,18 @@ class MainWindow(QMainWindow):
                 )
             self.set_status(tr("已生成 {count} 封邮件预览").format(count=count))
 
-        dialog = TaskProgressDialog(self, tr("生成邮件预览"))
+        dialog = TaskProgressDialog(
+            self,
+            tr("正在生成邮件") if len(ids) > 1 else tr("生成邮件预览"),
+        )
+        dialog.update_summary(
+            total=len(ids),
+            completed=0,
+            success=0,
+            failed=0,
+            waiting=0,
+            review=0,
+        )
         self._current_progress_dialog = dialog
         dialog.show()
 
@@ -1043,6 +1167,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择要填写草稿的联系人。"))
             return
         ids = self._cap_task_ids(ids)
+        template_names = {
+            str(item.get("name") or "")
+            for item in self.settings.saved_templates
+        }
+        invalid_bindings = []
+        for row in self.db.get_tasks(ids):
+            profile = str(row["profile_no"] or "")
+            binding = self.settings.window_bindings.get(profile) or {}
+            template_name = str(binding.get("template_name") or "")
+            if template_name and template_name not in template_names:
+                invalid_bindings.append((profile, template_name))
+        if invalid_bindings:
+            detail = "\n".join(
+                tr("窗口 {profile}：模板已删除/失效：{name}")
+                .format(profile=profile, name=name)
+                for profile, name in invalid_bindings[:8]
+            )
+            QMessageBox.warning(
+                self,
+                tr("模板绑定不完整"),
+                tr("以下窗口绑定的模板已删除或失效，请先在窗口页面重新选择模板：\n\n{detail}")
+                .format(detail=detail),
+            )
+            return
 
         matched_ids: list[int] = ids
         waiting_ids: list[int] = []
@@ -1050,6 +1198,7 @@ class MainWindow(QMainWindow):
         if wait_send:
             rows = [dict(row) for row in self.db.get_tasks(ids)]
             open_windows: list[int] = []
+            provider_last_error = ""
             try:
                 provider = create_browser_provider(self.settings)
                 list_open = getattr(provider, "list_running_windows", None)
@@ -1061,6 +1210,15 @@ class MainWindow(QMainWindow):
                     for number, _name in raw_windows
                     if str(number).isdigit()
                 ]
+                ordered: list[int] = []
+                for window in self.settings.window_sequence:
+                    if window in open_windows and window not in ordered:
+                        ordered.append(window)
+                for window in sorted(open_windows, reverse=True):
+                    if window not in ordered:
+                        ordered.append(window)
+                open_windows = ordered
+                provider_last_error = getattr(provider, "last_error", "")
             except Exception as exc:
                 self.show_error(tr("读取窗口失败"), str(exc))
                 return
@@ -1068,8 +1226,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     tr("没有可用窗口"),
-                    tr("未检测到已经打开并且可以连接的浏览器窗口。\n"
-                       "请先打开浏览器窗口后重试。"),
+                    (
+                        provider_last_error
+                        or tr("未检测到已经打开并且可以连接的浏览器窗口。\n"
+                              "请先打开浏览器窗口后重试。")
+                    ),
                 )
                 return
             assignments = assign_windows(rows, open_windows)
@@ -1198,44 +1359,36 @@ class MainWindow(QMainWindow):
         def run(cancel_event, progress, task_status, task_ids, waiting):
             workflow = self.workflow
 
-            def worker(ce, pr, task_id):
-                row = self.db.get_task(task_id)
-                email = row["recipient_email"] if row is not None else ""
-                profile = row["profile_no"] if row is not None else ""
-
-                def stage(value, text):
-                    task_status(str(profile), email, text, "")
-                    pr(
-                        -1,
-                        f"{tr('当前')}：{email} · {tr('窗口')}：{profile}\n{text}",
+            def summary(stats):
+                dialog = self._current_progress_dialog
+                if dialog is not None:
+                    dialog.update_summary(
+                        total=len(task_ids),
+                        completed=stats.get("completed", 0),
+                        success=(
+                            stats.get("sent", 0)
+                            if waiting
+                            else stats.get("drafted", 0)
+                        ),
+                        failed=stats.get("failed", 0),
+                        waiting=len(waiting_ids) if waiting else 0,
+                        review=stats.get("needs_review", 0),
                     )
-
-                if waiting:
-                    return workflow.open_and_send(
-                        task_id,
-                        progress=stage,
-                        cancel_event=ce,
-                    )
-                return workflow.open_draft(
-                    task_id,
-                    progress=stage,
-                    cancel_event=ce,
-                )
 
             if waiting:
-                return self._run_window_parallel(
-                    cancel_event,
-                    progress,
+                return workflow.run_send_batch(
                     task_ids,
-                    worker,
+                    progress=progress,
                     task_status=task_status,
+                    cancel_event=cancel_event,
+                    on_summary=summary,
                 )
-            return self._run_window_parallel(
-                cancel_event,
-                progress,
+            return workflow.run_draft_batch(
                 task_ids,
-                worker,
+                progress=progress,
                 task_status=task_status,
+                cancel_event=cancel_event,
+                on_summary=summary,
             )
 
         def done(result):
@@ -1246,20 +1399,32 @@ class MainWindow(QMainWindow):
                              "需确认 {review} · 等待窗口 {waiting}")
                 dialog = self._current_progress_dialog
                 if dialog is not None:
-                    dialog.finish(
-                        summary.format(
-                            sent=result.get("sent", 0),
-                            failed=result.get("failed", 0),
-                            review=result.get("needs_review", 0),
-                            waiting=len(waiting_ids),
-                        )
+                    text = summary.format(
+                        sent=result.get("sent", 0),
+                        failed=result.get("failed", 0),
+                        review=result.get("needs_review", 0),
+                        waiting=len(waiting_ids),
                     )
+                    if waiting_ids:
+                        text += "\n" + tr(
+                            "有 {count} 封邮件未发送：没有足够的浏览器窗口，"
+                            "请再打开 {count} 个窗口后重试。"
+                        ).format(count=len(waiting_ids))
+                    dialog.finish(text)
                 self.set_status(
                     summary.format(
                         sent=result.get("sent", 0),
                         failed=result.get("failed", 0),
                         review=result.get("needs_review", 0),
                         waiting=len(waiting_ids),
+                    )
+                    + (
+                        "\n"
+                        + tr("有 {count} 封邮件未发送：没有足够的浏览器窗口，"
+                             "请再打开 {count} 个窗口后重试。")
+                        .format(count=len(waiting_ids))
+                        if waiting_ids
+                        else ""
                     )
                 )
             else:
@@ -1275,6 +1440,14 @@ class MainWindow(QMainWindow):
         )
         self._current_progress_dialog = dialog
         dialog.show()
+        dialog.update_summary(
+            total=len(matched_ids),
+            completed=0,
+            success=0,
+            failed=0,
+            waiting=len(waiting_ids) if wait_send else 0,
+            review=0,
+        )
         self.run_async(run, on_done=done, task_ids=matched_ids, waiting=wait_send)
 
     def send_single_task(self, task_id: int) -> None:
@@ -1478,32 +1651,17 @@ class MainWindow(QMainWindow):
 
         def run(cancel_event, progress, task_status, task_ids):
             workflow = self.workflow
-
-            def worker(ce, pr, task_id):
-                row = self.db.get_task(task_id)
-                email = row["recipient_email"] if row is not None else ""
-                profile = row["profile_no"] if row is not None else ""
-
-                def stage(value, text):
-                    task_status(str(profile), email, text, "")
-                    pr(
-                        -1,
-                        f"{tr('当前')}：{email} · {tr('窗口')}：{profile}\n{text}",
-                    )
-
-                workflow.generate_local(task_id, cancel_event=ce)
-                return workflow.open_and_send(
-                    task_id,
-                    progress=stage,
-                    cancel_event=ce,
-                )
-
-            return self._run_window_parallel(
-                cancel_event,
-                progress,
+            workflow.generate_local_batch(
                 task_ids,
-                worker,
+                cancel_event=cancel_event,
+                progress=progress,
                 task_status=task_status,
+            )
+            return workflow.run_send_batch(
+                task_ids,
+                progress=progress,
+                task_status=task_status,
+                cancel_event=cancel_event,
             )
 
         self.run_async(run, task_ids=ids)
@@ -1515,6 +1673,7 @@ class MainWindow(QMainWindow):
         self.settings.sender_name = sender or self.settings.sender_name
         self.settings.signature = signature
         self.settings.save()
+        self.refresh_window_bindings()
         self.set_status(tr("模板已保存"))
 
     def save_template_library(self, name: str, subject: str, body: str, sender: str, signature: str) -> None:
@@ -1531,6 +1690,7 @@ class MainWindow(QMainWindow):
         )
         self.settings.saved_templates = templates
         self.settings.save()
+        self.refresh_window_bindings()
         self.set_status(tr("模板已存入模板库：{name}").format(name=name))
 
     def load_template_library(self, name: str) -> None:
@@ -1545,6 +1705,7 @@ class MainWindow(QMainWindow):
         self.settings.sender_name = str(template.get("sender_name") or self.settings.sender_name)
         self.settings.signature = str(template.get("signature") or "")
         self.settings.save()
+        self.refresh_window_bindings()
         self.set_status(tr("已载入模板：{name}").format(name=name))
 
     def delete_template_library(self, name: str) -> None:
@@ -1552,7 +1713,13 @@ class MainWindow(QMainWindow):
             item for item in self.settings.saved_templates if item.get("name") != name
         ]
         self.settings.save()
+        self.refresh_window_bindings()
         self.set_status(tr("模板已删除：{name}").format(name=name))
+
+    def refresh_window_bindings(self) -> None:
+        panel = getattr(self.pages[0], "window_panel", None)
+        if panel is not None:
+            panel.refresh_preserving()
 
     def preview_template(self, subject: str, body: str, sender: str, signature: str) -> None:
         try:
@@ -1587,30 +1754,52 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- windows
     def auto_fill_windows(self) -> None:
+        captured_error: list[str] = [""]
+
         def run(cancel_event, progress):
             progress(0, tr("正在读取浏览器窗口…"))
             provider = create_browser_provider(self.settings)
             list_open = getattr(provider, "list_running_windows", None)
             if list_open is not None:
-                return list_open(verify_connection=True)
-            return provider.list_windows()
+                windows = list_open(verify_connection=True)
+            else:
+                windows = provider.list_windows()
+            captured_error[0] = getattr(provider, "last_error", "")
+            return windows
 
         def done(windows):
-            numbers: list[int] = []
+            discovered: list[int] = []
             for number, _name in windows:
                 try:
                     parsed = int(number)
                 except (TypeError, ValueError):
                     continue
-                if parsed > 0 and parsed not in numbers and len(numbers) < MAX_WINDOW_SEQUENCE:
-                    numbers.append(parsed)
-            if not numbers:
-                self.show_error(tr("未发现窗口"), tr("浏览器窗口应用没有返回可用窗口。"))
+                if parsed > 0 and parsed not in discovered:
+                    discovered.append(parsed)
+            if not discovered:
+                self.show_error(
+                    tr("未发现窗口"),
+                    captured_error[0] or tr("浏览器窗口应用没有返回可用窗口。"),
+                )
                 return
-            self.settings.window_sequence = numbers
-            self.settings.save()
-            self.pages[0].window_panel.load()
-            self.set_status(tr("已填充 {count} 个窗口编号").format(count=len(numbers)))
+            merged: list[int] = []
+            saved = list(self.settings.window_sequence)
+            for window in saved:
+                if window in discovered and window not in merged:
+                    merged.append(window)
+            for window in sorted(discovered, reverse=True):
+                if window not in merged and len(merged) < MAX_WINDOW_SEQUENCE:
+                    merged.append(window)
+            try:
+                self.settings.save_window_sequence(merged)
+            except Exception as exc:
+                self.show_error(tr("窗口顺序保存失败"), str(exc))
+                return
+            self.pages[0].window_panel.sync_after_sequence_change()
+            self.set_status(
+                tr("已填充 {count} 个窗口编号，并保留已有排序")
+                .format(count=len(merged))
+            )
 
         def error(exc):
             self.show_error(tr("读取窗口失败"), str(exc))
@@ -1699,6 +1888,100 @@ class MainWindow(QMainWindow):
                 os.system(f'explorer "{folder}"')
         except OSError as exc:
             self.show_error(tr("打开失败"), str(exc))
+
+    def open_data_folder(self) -> None:
+        folder = str(app_data_dir())
+        if sys.platform == "win32":
+            try:
+                os.startfile(folder)
+                return
+            except OSError as exc:
+                self.show_error(tr("打开失败"), str(exc))
+                return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def export_redacted_diagnostics(self) -> None:
+        from datetime import datetime
+
+        from ..diagnostics import diagnostics_dir, redact_settings
+        from ..trial import authorization_info
+
+        payload = {
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "app_version": str(__version__),
+            "settings_path": str(app_data_dir() / "settings.json"),
+            "database_path": str(self.db.path),
+            "settings": redact_settings(self.settings),
+            "authorization": authorization_info(self.trial_status),
+        }
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = diagnostics_dir() / f"diagnostic_{stamp}.json"
+        try:
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.show_error(tr("导出失败"), str(exc))
+            return
+        QMessageBox.information(self, tr("诊断已导出"), str(path))
+
+    def check_data_consistency(self) -> None:
+        from ..trial import _load_state_records
+
+        problems: list[str] = []
+        checks: list[str] = []
+
+        try:
+            fresh_settings = Settings.load()
+            field_problems = getattr(fresh_settings, "_load_problems", [])
+            if field_problems:
+                problems.extend(field_problems)
+            else:
+                checks.append(tr("设置文件可正常解析"))
+        except Exception as exc:
+            problems.append(tr("设置文件解析失败：{error}").format(error=exc))
+
+        try:
+            with self.db.connect() as conn:
+                result = conn.execute("PRAGMA integrity_check").fetchone()
+                if result is None or str(result[0]) != "ok":
+                    problems.append(tr("数据库完整性检查未通过"))
+                else:
+                    checks.append(tr("数据库完整性检查通过"))
+        except Exception as exc:
+            problems.append(tr("数据库检查失败：{error}").format(error=exc))
+
+        loaded = _load_state_records()
+        if loaded:
+            checks.append(
+                tr("授权记录有效（{count} 条）").format(count=len(loaded))
+            )
+        else:
+            problems.append(tr("未找到有效的授权记录，请到管理员授权中重新验证"))
+
+        sequence = {str(number) for number in self.settings.window_sequence}
+        stale_bindings = [
+            str(window)
+            for window in self.settings.window_bindings
+            if str(window) not in sequence
+        ]
+        if stale_bindings:
+            checks.append(
+                tr("存在 {count} 条历史隐藏绑定（不参与当前分配）")
+                .format(count=len(stale_bindings))
+            )
+        else:
+            checks.append(tr("窗口绑定与窗口顺序一致"))
+
+        text = "\n".join(f"• {item}" for item in checks)
+        if problems:
+            text += "\n\n" + tr("发现的问题：") + "\n"
+            text += "\n".join(f"• {item}" for item in problems)
+        if problems:
+            QMessageBox.warning(self, tr("检查数据一致性"), text)
+        else:
+            QMessageBox.information(self, tr("检查数据一致性"), text)
 
     def check_update(self) -> None:
         url = self.settings.update_url.strip()
@@ -1804,26 +2087,92 @@ class MainWindow(QMainWindow):
         palette.show_below_header()
 
     # ---------------------------------------------------------------- close
+    def _close_choice(self) -> str:
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("退出牛马邮箱"))
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            tr("选择关闭方式：\n\n"
+               "后台运行：最小化到任务栏，任务继续执行；\n"
+               "直接退出：停止任务后关闭程序；\n"
+               "取消：保持当前状态继续使用。")
+        )
+        background_button = box.addButton(
+            tr("后台运行"), QMessageBox.AcceptRole
+        )
+        exit_button = box.addButton(
+            tr("直接退出"), QMessageBox.DestructiveRole
+        )
+        cancel_button = box.addButton(tr("取消"), QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is background_button:
+            return "background"
+        if clicked is exit_button:
+            return "exit"
+        return "cancel"
+
     def closeEvent(self, event) -> None:
+        if self._closing:
+            cancel_event = getattr(self, "_close_cancel_event", None)
+            serial = getattr(self, "_close_serial", 0)
+            if cancel_event is not None:
+                self.operations.finish(cancel_event, serial)
+            self._save_close_state()
+            event.accept()
+            return
+        choice = self._close_choice()
+        if choice == "background":
+            self.showMinimized()
+            event.ignore()
+            return
+        if choice == "cancel":
+            event.ignore()
+            return
         self._closing = True
-        cancel_event, serial = self.operations.begin()
+        self._close_started = time.monotonic()
+        self._close_prompt_shown = False
+        self._close_pending_event = event
+        self._close_cancel_event, self._close_serial = self.operations.begin()
         self.thread_pool.clear()
-        if not self.thread_pool.waitForDone(30_000):
+        if self.thread_pool.waitForDone(1500):
+            self._finish_close()
+            return
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(250)
+        self._close_timer.timeout.connect(self._poll_close)
+        self._close_timer.start()
+        event.ignore()
+
+    def _poll_close(self) -> None:
+        if self.thread_pool.waitForDone(0):
+            self._close_timer.stop()
+            self._finish_close()
+            return
+        if (
+            not self._close_prompt_shown
+            and time.monotonic() - self._close_started > 20
+        ):
+            self._close_prompt_shown = True
             answer = QMessageBox.question(
                 self,
                 tr("任务仍在运行"),
-                tr("仍有后台任务未结束（例如正在等待 Gmail 发送结果）。"
-                   "确定立即退出？"),
+                tr("仍有后台任务未结束，确定强制退出？"),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
-            if answer != QMessageBox.Yes:
-                self._closing = False
-                event.ignore()
-                return
-        self.operations.finish(cancel_event, serial)
+            if answer == QMessageBox.Yes:
+                self._close_timer.stop()
+                self._finish_close()
+
+    def _finish_close(self) -> None:
+        self.close()
+
+    def _save_close_state(self) -> None:
         self.settings_store.setValue("geometry", self.saveGeometry())
+        self.ui_state.setValue("last_page", self._current_page)
+        self.ui_state.flush()
         campaign_id = self.pages[0].current_campaign_id()
         if campaign_id is not None:
             self.settings_store.setValue("last_campaign_id", campaign_id)
-        super().closeEvent(event)

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QListView,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -29,6 +30,7 @@ from .icons import icon
 from .models import CampaignListModel, HistoryModel
 from .panels import (
     CampaignItemDelegate,
+    CollapsibleDetails,
     PageHeader,
     StatsBar,
     TaskInspector,
@@ -36,7 +38,11 @@ from .panels import (
     TemplateEditor,
     WindowPanel,
 )
+from .ui_state import UiStateStore
 from .widgets import IconButton, LicenseDialog, SearchBox
+
+
+SettingsStateStore = UiStateStore
 
 
 class ActivityPage(QWidget):
@@ -82,14 +88,37 @@ class ActivityPage(QWidget):
         splitter.setHandleWidth(1)
         splitter.addWidget(self._build_workspace())
         self.inspector = TaskInspector(window)
-        self.inspector.setMinimumWidth(300)
-        self.inspector.setMaximumWidth(420)
-        splitter.addWidget(self.inspector)
+        self.details_wrapper = CollapsibleDetails(
+            self.inspector,
+            window.ui_state,
+            "activity_details",
+        )
+        splitter.addWidget(self.details_wrapper)
+        self.details_wrapper.splitter = splitter
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([900, 340])
+        self.details_wrapper.restore_width()
+        splitter.splitterMoved.connect(
+            lambda _pos, _index: self.details_wrapper.save_width(
+                self.details_wrapper.width()
+            )
+        )
         body.addWidget(splitter, 1)
         layout.addLayout(body, 1)
+
+        self.tabs.currentChanged.connect(self._on_activity_tab_changed)
+
+    def _on_activity_tab_changed(self, index: int) -> None:
+        if index in {1, 2}:
+            self.details_wrapper.set_visible_override(False)
+        else:
+            self.details_wrapper.set_visible_override(None)
+        if index == 2:
+            self.window.refresh_window_bindings()
+
+    def inspector_auto_show(self) -> None:
+        self.details_wrapper.auto_show()
 
     def _build_campaign_panel(self) -> QWidget:
         panel = QFrame()
@@ -359,13 +388,26 @@ class ContactsPage(QWidget):
         )
         body.addWidget(self.panel)
         self.inspector = TaskInspector(window)
-        self.inspector.setMinimumWidth(300)
-        self.inspector.setMaximumWidth(420)
-        body.addWidget(self.inspector)
+        self.details_wrapper = CollapsibleDetails(
+            self.inspector,
+            window.ui_state,
+            "contacts_details",
+        )
+        body.addWidget(self.details_wrapper)
+        self.details_wrapper.splitter = body
         body.setStretchFactor(0, 4)
         body.setStretchFactor(1, 1)
         body.setSizes([900, 340])
+        self.details_wrapper.restore_width()
+        body.splitterMoved.connect(
+            lambda _pos, _index: self.details_wrapper.save_width(
+                self.details_wrapper.width()
+            )
+        )
         layout.addWidget(body, 1)
+
+    def inspector_auto_show(self) -> None:
+        self.details_wrapper.auto_show()
 
     def set_tasks(self, rows) -> None:
         self.panel.set_tasks(rows)
@@ -587,6 +629,29 @@ class SettingsPage(QWidget):
         maintenance_layout.addWidget(update_button)
         maintenance_layout.addStretch(1)
         right_column.addWidget(maintenance_card, 1)
+
+        diagnostics_card = QFrame()
+        diagnostics_card.setObjectName("card")
+        diagnostics_layout = QVBoxLayout(diagnostics_card)
+        diagnostics_layout.setContentsMargins(16, 16, 16, 16)
+        diagnostics_layout.setSpacing(9)
+        diagnostics_layout.addWidget(self._title(tr("数据与授权诊断")))
+        self.diagnostics_text = QPlainTextEdit()
+        self.diagnostics_text.setReadOnly(True)
+        self.diagnostics_text.setMaximumHeight(260)
+        diagnostics_layout.addWidget(self.diagnostics_text)
+        diagnostics_buttons = QHBoxLayout()
+        open_data_button = QPushButton(tr("打开数据目录"))
+        open_data_button.clicked.connect(self.window.open_data_folder)
+        export_button = QPushButton(tr("导出脱敏诊断"))
+        export_button.clicked.connect(self.window.export_redacted_diagnostics)
+        check_button = QPushButton(tr("检查数据一致性"))
+        check_button.clicked.connect(self.window.check_data_consistency)
+        diagnostics_buttons.addWidget(open_data_button)
+        diagnostics_buttons.addWidget(export_button)
+        diagnostics_buttons.addWidget(check_button)
+        diagnostics_layout.addLayout(diagnostics_buttons)
+        right_column.addWidget(diagnostics_card, 1)
         body.addLayout(right_column, 2)
         layout.addLayout(body, 1)
 
@@ -619,14 +684,90 @@ class SettingsPage(QWidget):
         from ..trial import device_code, remaining_text
 
         self.device_code_edit.setText(device_code())
-        self.license_status.setText(tr(remaining_text(self.window.trial_status)))
+        license_text = tr(remaining_text(self.window.trial_status))
+        if getattr(self.window.trial_status, "suspicious", False):
+            license_text += "\n" + tr(
+                "检测到授权状态异常，请核对（已暂停自动写回）"
+            )
+        self.license_status.setText(license_text)
+        self._refresh_diagnostics()
+
+    def _refresh_diagnostics(self) -> None:
+        from datetime import datetime
+
+        from .. import __version__
+        from ..config import SETTINGS_SCHEMA_VERSION, settings_path
+        from ..database import DATABASE_SCHEMA_VERSION
+        from ..trial import authorization_info, remaining_text
+
+        settings = self.window.settings
+        auth = authorization_info(self.window.trial_status)
+        sequence = list(settings.window_sequence)
+        bindings = settings.window_bindings
+        current_set = {str(number) for number in sequence}
+        hidden_count = sum(
+            1 for window in bindings if str(window) not in current_set
+        )
+        changed_at = int(auth.get("last_changed_at") or 0)
+        changed_iso = (
+            datetime.fromtimestamp(changed_at).isoformat() if changed_at else "无"
+        )
+        lines = [
+            tr("当前配置文件路径：{path}").format(path=settings_path()),
+            tr("当前数据库路径：{path}").format(path=self.window.db.path),
+            tr("当前授权文件路径：{path}").format(path=auth["state_path"]),
+            tr("当前软件版本：v{version}").format(version=__version__),
+            tr("配置结构版本：{version}").format(
+                version=getattr(settings, "_schema_version", 0)
+                or SETTINGS_SCHEMA_VERSION
+            ),
+            tr("数据库结构版本：{version}").format(
+                version=DATABASE_SCHEMA_VERSION
+            ),
+            tr("授权状态版本：{version}").format(version=auth["state_version"]),
+            tr("当前浏览器类型：{provider}").format(
+                provider=settings.browser_provider
+            ),
+            tr("窗口顺序：{windows}").format(
+                windows="、".join(str(number) for number in sequence) or tr("无")
+            ),
+            tr("当前绑定窗口：{windows}").format(
+                windows="、".join(str(number) for number in sequence) or tr("无")
+            ),
+            tr("历史隐藏绑定数量：{count}").format(count=hidden_count),
+            tr("授权到期时间：{time}").format(
+                time=auth["authorized_until_iso"] or tr("无")
+            ),
+            tr("授权来源：{source}").format(source=auth["grant_source"] or tr("无")),
+            tr("最近一次授权变更时间：{time}").format(time=changed_iso),
+            tr("最近一次变更原因：{reason}").format(
+                reason=auth["change_reason"] or tr("无")
+            ),
+            tr("当前机器码摘要：{digest}").format(digest=auth["machine_digest"]),
+            tr("是否读取了备份文件：{value}").format(
+                value=tr("是") if auth["backup_used"] else tr("否")
+            ),
+            tr("是否发生了迁移：{value}").format(
+                value=tr("是") if auth.get("migrated_at") else tr("否")
+            ),
+            tr("授权状态异常：{value}").format(
+                value=tr("是") if auth["suspicious"] else tr("否")
+            ),
+            tr("授权剩余时间：{text}").format(
+                text=remaining_text(self.window.trial_status)
+            ),
+        ]
+        self.diagnostics_text.setPlainText("\n".join(lines))
 
     def save(self) -> None:
         settings = self.window.settings
+        new_api_key = self.api_key_edit.text().strip()
+        if new_api_key != settings.adspower_api_key:
+            settings.mark_api_key_dirty()
         settings.browser_provider = str(self.provider_combo.currentData() or "morelogin")
         settings.morelogin_url = self.morelogin_edit.text().strip()
         settings.adspower_url = self.adspower_edit.text().strip()
-        settings.adspower_api_key = self.api_key_edit.text().strip()
+        settings.adspower_api_key = new_api_key
         settings.bitbrowser_url = self.bitbrowser_edit.text().strip()
         settings.sender_name = self.sender_edit.text().strip() or "Anna Lee"
         settings.language = str(self.language_combo.currentData() or "zh")

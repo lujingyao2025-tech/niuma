@@ -9,12 +9,14 @@ import platform
 import struct
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from .config import APP_NAME
 
 
 TRIAL_DAYS = 3
@@ -27,6 +29,8 @@ ALLOWED_AUTHORIZATION_SECONDS = {
 }
 CLOCK_ROLLBACK_TOLERANCE_SECONDS = 5 * 60
 _STATE_VERSION = 2
+_CURRENT_STATE_VERSION = 3
+_LEGACY_STATE_VERSIONS = {2}
 _CODE_VERSION = 1
 _STATE_SIGNING_KEY = b"NiuMaMail-weekly-authorization-state-v2-2026"
 _EVER_MARKER_VERSION = 1
@@ -37,6 +41,8 @@ _REGISTRY_VALUE = "WeeklyAuthorizationState"
 _EVER_MARKER_REGISTRY_VALUE = "EverInstalled"
 _CODE_STRUCT = struct.Struct(">B16sIII")
 _MACHINE_SOURCE_CACHE: str | None = None
+_STATE_MIGRATION_ID = "niuma-license-primary-v3-2026-08-30"
+_AUTHORIZATION_ANOMALY_TOLERANCE_SECONDS = 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,18 @@ class TrialStatus:
     started_at: int
     expires_at: int
     remaining_seconds: int
+    suspicious: bool = False
+    source: str = ""
+    state_path: str = ""
+    state_version: int = 0
+    machine_digest: str = ""
+    backup_used: bool = False
+    migration_id: str = ""
+    last_changed_at: int = 0
+    change_reason: str = ""
+    migrated_at: int = 0
+    records_count: int = 0
+    info: dict = field(default_factory=dict)
 
 
 def _volume_serial() -> str:
@@ -146,49 +164,72 @@ def device_code() -> str:
     return "-".join(raw[index:index + 4] for index in range(0, len(raw), 4))
 
 
-def _state_paths() -> list[Path]:
+def _primary_state_path() -> Path:
     override = os.getenv("NIUMA_MAIL_TRIAL_DIR")
     if override:
-        return [Path(override) / "weekly_authorization.dat"]
-    paths: list[Path] = []
+        return Path(override) / "weekly_authorization.dat"
+    local_data = (
+        Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        / APP_NAME
+        / "weekly_authorization.dat"
+    )
+    return local_data
+
+
+def _state_paths() -> list[Path]:
+    """Return the single primary authorization state path."""
+    return [_primary_state_path()]
+
+
+def _legacy_state_candidates() -> list[Path]:
+    """Return old data directories that may still hold pre-v3 state."""
+    override = os.getenv("NIUMA_MAIL_TRIAL_DIR")
+    if override:
+        return []
+    candidates: list[Path] = []
     if os.name == "nt":
         program_data = (
             Path(os.getenv("PROGRAMDATA", r"C:\ProgramData"))
             / "NiuMaMail"
             / "weekly_authorization.dat"
         )
-        paths.append(program_data)
+        candidates.append(program_data)
     local_data = (
         Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         / "NiuMaMail"
         / "weekly_authorization.dat"
     )
-    if local_data not in paths:
-        paths.append(local_data)
-    if not paths:
-        paths.append(Path.home() / ".niuma-mail" / "weekly_authorization.dat")
-    return paths
+    if local_data not in candidates:
+        candidates.append(local_data)
+    roaming_data = (
+        Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
+        / "NiuMaMail"
+        / "weekly_authorization.dat"
+    )
+    if roaming_data not in candidates:
+        candidates.append(roaming_data)
+    home_data = Path.home() / ".niuma-mail" / "weekly_authorization.dat"
+    if home_data not in candidates:
+        candidates.append(home_data)
+    install_data = (
+        Path(os.getenv("ProgramFiles", r"C:\Program Files"))
+        / "NiuMaMail"
+        / "weekly_authorization.dat"
+    )
+    if install_data not in candidates:
+        candidates.append(install_data)
+    return candidates
 
 
 def _ever_marker_paths() -> list[Path]:
     override = os.getenv("NIUMA_MAIL_TRIAL_DIR")
     if override:
         return [Path(override) / "ever_installed.dat"]
-    local_data = (
+    return [
         Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        / "NiuMaMail"
+        / APP_NAME
         / "ever_installed.dat"
-    )
-    paths = [local_data]
-    if os.name == "nt":
-        program_data = (
-            Path(os.getenv("PROGRAMDATA", r"C:\ProgramData"))
-            / "NiuMaMail"
-            / "ever_installed.dat"
-        )
-        if program_data not in paths:
-            paths.append(program_data)
-    return paths
+    ]
 
 
 def _registry_disabled() -> bool:
@@ -216,7 +257,10 @@ def _decode_record(raw: str, machine_hex: str) -> dict[str, object] | None:
         ).hexdigest()
         if not hmac.compare_digest(signature, expected):
             return None
-        if int(payload.get("version", 0)) != _STATE_VERSION:
+        record_version = int(payload.get("version", 0))
+        if record_version != _CURRENT_STATE_VERSION and (
+            record_version not in _LEGACY_STATE_VERSIONS
+        ):
             return None
         if str(payload.get("machine", "")) != machine_hex:
             return None
@@ -237,6 +281,14 @@ def _decode_record(raw: str, machine_hex: str) -> dict[str, object] | None:
             int(clean_code_id, 16)
             redeemed_codes[clean_code_id] = clean_expires_at
         payload["redeemed_codes"] = redeemed_codes
+        payload.setdefault("grant_source", "legacy")
+        payload.setdefault("granted_at", int(payload.get("last_seen_at", started)))
+        payload.setdefault("change_reason", "")
+        payload.setdefault("migration_id", "")
+        payload.setdefault("migrated_at", 0)
+        payload.setdefault("backup_used", False)
+        payload.setdefault("updated_at", int(payload.get("last_seen_at", started)))
+        payload["version"] = record_version
         return payload
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -266,6 +318,222 @@ def _write_file(raw: str) -> bool:
         except OSError:
             pass
     return saved
+
+
+def _journal_path() -> Path:
+    override = os.getenv("NIUMA_MAIL_TRIAL_DIR")
+    if override:
+        return Path(override) / "license_journal.jsonl"
+    from .config import app_data_dir
+
+    return app_data_dir() / "license_journal.jsonl"
+
+
+def _data_dir() -> Path:
+    override = os.getenv("NIUMA_MAIL_TRIAL_DIR")
+    if override:
+        return Path(override)
+    from .config import app_data_dir
+
+    return app_data_dir()
+
+
+def _journal_append(record: dict) -> None:
+    try:
+        path = _data_dir() / "license_journal.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _journal_last() -> dict | None:
+    path = _journal_path()
+    if not path.exists():
+        return None
+    try:
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return records[-1] if records else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _append_migration_log(record: dict) -> None:
+    path = _data_dir() / "migrations.jsonl"
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _read_candidate(path: Path) -> tuple[str, dict | None]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return "", None
+    if not raw:
+        return "", None
+    return raw, _decode_record(raw, _machine_digest().hex())
+
+
+def _load_state_records() -> list[tuple[Path, str, dict]]:
+    """Load valid records from the primary path, or legacy paths if absent."""
+    primary = _primary_state_path()
+    if primary.exists():
+        raw, record = _read_candidate(primary)
+        if raw:
+            return [(primary, raw, record)] if record is not None else []
+        return []
+
+    found: list[tuple[Path, str, dict]] = []
+    for path in _legacy_state_candidates():
+        raw, record = _read_candidate(path)
+        if raw and record is not None:
+            found.append((path, raw, record))
+    return found
+
+
+def _invalid_state_present() -> bool:
+    primary = _primary_state_path()
+    if primary.exists():
+        raw, record = _read_candidate(primary)
+        return bool(raw) and record is None
+    for path in _legacy_state_candidates():
+        raw, record = _read_candidate(path)
+        if raw and record is None:
+            return True
+    return False
+
+
+def _choose_canonical(
+    records: list[tuple[Path, str, dict]],
+) -> tuple[Path, dict] | None:
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0][0], records[0][2]
+    ranked = sorted(
+        records,
+        key=lambda item: (
+            int(item[2].get("last_seen_at") or 0),
+            int(item[2].get("version") or 0),
+            int(item[2].get("authorized_until") or 0),
+            str(item[2].get("migration_id") or ""),
+        ),
+        reverse=True,
+    )
+    return ranked[0][0], ranked[0][2]
+
+
+def _explained_by_journal(authorized_until: int) -> bool:
+    last = _journal_last()
+    if last is None:
+        return False
+    if last.get("event") == "anomaly_detected":
+        return False
+    if last.get("event") in {
+        "activation",
+        "renewal",
+        "migration",
+        "recovery",
+        "trial_creation",
+    }:
+        try:
+            return int(last["new_until"]) == int(authorized_until)
+        except (KeyError, TypeError, ValueError):
+            return False
+    try:
+        return (
+            abs(int(last.get("new_until") or 0) - int(authorized_until))
+            <= _AUTHORIZATION_ANOMALY_TOLERANCE_SECONDS
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_suspicious(record: dict) -> bool:
+    """Detect unexplained authorization jumps in records without a journal."""
+    authorized_until = int(record["authorized_until"])
+    if _explained_by_journal(authorized_until):
+        return False
+    redeemed_codes = record.get("redeemed_codes") or {}
+    grant_type = str(record.get("grant_type") or "")
+    if grant_type != "admin" or not redeemed_codes:
+        return False
+    latest_code_expiry = max(int(value) for value in redeemed_codes.values())
+    if authorized_until <= latest_code_expiry + _AUTHORIZATION_ANOMALY_TOLERANCE_SECONDS:
+        return False
+    return True
+
+
+def _backup_legacy_file(path: Path) -> Path | None:
+    try:
+        backup_dir = _data_dir() / "backups" / "license"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        target = backup_dir / f"{path.parent.name}_{path.name}"
+        target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        return target
+    except OSError:
+        return None
+
+
+def _save_state_v3(
+    started_at: int,
+    last_seen_at: int,
+    authorized_until: int,
+    grant_type: str,
+    redeemed_codes: dict[str, int] | None = None,
+    *,
+    grant_source: str = "trial",
+    change_reason: str = "",
+    granted_at: int | None = None,
+    migration_id: str = "",
+    migrated_at: int = 0,
+    backup_used: bool = False,
+) -> bool:
+    payload = {
+        "version": _CURRENT_STATE_VERSION,
+        "machine": _machine_digest().hex(),
+        "started_at": started_at,
+        "last_seen_at": last_seen_at,
+        "authorized_until": authorized_until,
+        "grant_type": grant_type,
+        "grant_source": grant_source,
+        "granted_at": int(granted_at or last_seen_at),
+        "change_reason": change_reason,
+        "migration_id": migration_id,
+        "migrated_at": migrated_at,
+        "backup_used": backup_used,
+        "updated_at": int(time.time()),
+        "redeemed_codes": redeemed_codes or {},
+    }
+    raw = _signed_record(payload)
+    return _write_file(raw)
+
+
+def _save_state(
+    started_at: int,
+    last_seen_at: int,
+    authorized_until: int,
+    grant_type: str,
+    redeemed_codes: dict[str, int] | None = None,
+) -> bool:
+    """Backward-compatible wrapper that writes the current v3 format."""
+    return _save_state_v3(
+        started_at,
+        last_seen_at,
+        authorized_until,
+        grant_type,
+        redeemed_codes,
+        grant_source="legacy",
+        change_reason="旧版记录写回",
+    )
 
 
 def _read_registry() -> str | None:
@@ -382,39 +650,10 @@ def _write_marker() -> bool:
     return file_saved or registry_saved
 
 
-def _save_state(
-    started_at: int,
-    last_seen_at: int,
-    authorized_until: int,
-    grant_type: str,
-    redeemed_codes: dict[str, int] | None = None,
-) -> bool:
-    payload = {
-        "version": _STATE_VERSION,
-        "machine": _machine_digest().hex(),
-        "started_at": started_at,
-        "last_seen_at": last_seen_at,
-        "authorized_until": authorized_until,
-        "grant_type": grant_type,
-        "redeemed_codes": redeemed_codes or {},
-    }
-    raw = _signed_record(payload)
-    file_saved = _write_file(raw)
-    registry_saved = _write_registry(raw)
-    return file_saved or registry_saved
-
-
 def _records() -> tuple[list[str], list[dict[str, object]]]:
-    machine_hex = _machine_digest().hex()
-    raw_records = list(_read_file())
-    registry_value = _read_registry()
-    if registry_value and registry_value not in raw_records:
-        raw_records.append(registry_value)
-    decoded = [
-        record
-        for raw in raw_records
-        if (record := _decode_record(raw, machine_hex)) is not None
-    ]
+    loaded = _load_state_records()
+    raw_records = [raw for _path, raw, _record in loaded]
+    decoded = [record for _path, _raw, record in loaded]
     return raw_records, decoded
 
 
@@ -436,43 +675,215 @@ def _active_redeemed_codes(
 def check_trial(now: int | None = None) -> TrialStatus:
     """Return weekly authorization status without deleting application data."""
     current = int(time.time() if now is None else now)
-    raw_records, decoded = _records()
+    if _invalid_state_present():
+        return TrialStatus(
+            False,
+            "授权记录无效或已被修改，请联系管理员验证",
+            current,
+            current,
+            0,
+            state_path=str(_primary_state_path()),
+        )
+    loaded = _load_state_records()
+    raw_records = [raw for _path, raw, _record in loaded]
+    decoded = [record for _path, _raw, record in loaded]
     if raw_records and not decoded:
-        return TrialStatus(False, "授权记录无效或已被修改，请联系管理员验证", current, current, 0)
+        return TrialStatus(
+            False,
+            "授权记录无效或已被修改，请联系管理员验证",
+            current,
+            current,
+            0,
+            state_path=str(_primary_state_path()),
+        )
 
-    redeemed_codes = _active_redeemed_codes(decoded, current)
+    canonical_pair = _choose_canonical(loaded) if loaded else None
+    canonical_path = canonical_pair[0] if canonical_pair else None
+    canonical = canonical_pair[1] if canonical_pair else None
     cleared_reset = False
-    if decoded:
-        started_at = min(int(record["started_at"]) for record in decoded)
-        last_seen_at = max(int(record["last_seen_at"]) for record in decoded)
-        authorized_until = max(int(record["authorized_until"]) for record in decoded)
-        explicit_admin = any(record.get("grant_type") == "admin" for record in decoded)
-        legacy_admin = authorized_until > started_at + AUTHORIZATION_SECONDS
-        grant_type = "admin" if explicit_admin or legacy_admin else "trial"
-        if grant_type == "trial":
-            # Keep the original first-use timestamp, but migrate older 1-day
-            # trial records to the current 3-day free period.
-            authorized_until = started_at + TRIAL_SECONDS
+    started_at = last_seen_at = authorized_until = current
+    grant_type = "trial"
+    redeemed_codes: dict[str, int] = {}
+    suspicious = False
+    grant_source = ""
+    change_reason = ""
+    granted_at = 0
+    migrated_at = 0
+    backup_used = False
+    migration_id = ""
+
+    if canonical is not None:
+        started_at = int(canonical["started_at"])
+        last_seen_at = int(canonical["last_seen_at"])
+        authorized_until = int(canonical["authorized_until"])
+        grant_type = "admin" if canonical.get("grant_type") == "admin" else "trial"
+        redeemed_codes = _active_redeemed_codes([canonical], current)
+        state_version = int(canonical.get("version") or 0)
+        grant_source = str(
+            canonical.get("grant_source")
+            or ("legacy" if state_version != _CURRENT_STATE_VERSION else "trial")
+        )
+        change_reason = str(canonical.get("change_reason") or "")
+        granted_at = int(canonical.get("granted_at") or 0)
+        migrated_at = int(canonical.get("migrated_at") or 0)
+        backup_used = bool(canonical.get("backup_used"))
+        migration_id = str(canonical.get("migration_id") or "")
+
+        suspicious = _is_suspicious(
+            {**canonical, "authorized_until": authorized_until}
+        )
+        if canonical_path is not None and str(canonical_path) != str(_primary_state_path()):
+            if suspicious:
+                grant_source = "legacy"
+                change_reason = change_reason or "旧版数据目录只读"
+            else:
+                backup_used = _backup_legacy_file(canonical_path) is not None
+                migration_id = _STATE_MIGRATION_ID
+                migrated_at = current
+                grant_source = "migration"
+                change_reason = change_reason or "从旧版数据目录迁移到唯一主数据目录"
+                saved = _save_state_v3(
+                    started_at,
+                    current,
+                    authorized_until,
+                    grant_type,
+                    redeemed_codes,
+                    grant_source=grant_source,
+                    change_reason=change_reason,
+                    granted_at=granted_at or current,
+                    migration_id=migration_id,
+                    migrated_at=migrated_at,
+                    backup_used=backup_used,
+                )
+                if not saved:
+                    return TrialStatus(
+                        False,
+                        "无法保存授权记录，请联系管理员",
+                        started_at,
+                        authorized_until,
+                        0,
+                    )
+                _journal_append(
+                    {
+                        "time": current,
+                        "event": "migration",
+                        "new_until": authorized_until,
+                        "reason": change_reason,
+                        "migration_id": migration_id,
+                    }
+                )
+                _append_migration_log(
+                    {
+                        "time": current,
+                        "kind": "license",
+                        "migration_id": migration_id,
+                        "from_path": str(canonical_path),
+                        "to_path": str(_primary_state_path()),
+                        "backup_used": backup_used,
+                    }
+                )
+                canonical_path = _primary_state_path()
+                state_version = _CURRENT_STATE_VERSION
+        elif state_version != _CURRENT_STATE_VERSION and not suspicious:
+            migration_id = _STATE_MIGRATION_ID
+            migrated_at = current
+            grant_source = grant_source or "migration"
+            change_reason = change_reason or "授权状态格式升级"
+            saved = _save_state_v3(
+                started_at,
+                current,
+                authorized_until,
+                grant_type,
+                redeemed_codes,
+                grant_source=grant_source,
+                change_reason=change_reason,
+                granted_at=granted_at or current,
+                migration_id=migration_id,
+                migrated_at=migrated_at,
+                backup_used=backup_used,
+            )
+            if not saved:
+                return TrialStatus(
+                    False,
+                    "无法保存授权记录，请联系管理员",
+                    started_at,
+                    authorized_until,
+                    0,
+                )
+            _journal_append(
+                {
+                    "time": current,
+                    "event": "migration",
+                    "new_until": authorized_until,
+                    "reason": change_reason,
+                    "migration_id": migration_id,
+                }
+            )
+            state_version = _CURRENT_STATE_VERSION
     else:
         if _read_marker():
             cleared_reset = True
-            started_at = current
-            last_seen_at = current
-            authorized_until = current
-            grant_type = "trial"
         else:
             started_at = current
             last_seen_at = current
             authorized_until = current + TRIAL_SECONDS
             grant_type = "trial"
+            grant_source = "trial"
+            change_reason = "首次试用启动"
+            granted_at = current
+            if not _save_state_v3(
+                started_at,
+                current,
+                authorized_until,
+                grant_type,
+                redeemed_codes,
+                grant_source=grant_source,
+                change_reason=change_reason,
+                granted_at=granted_at,
+            ):
+                return TrialStatus(
+                    False,
+                    "无法保存授权记录，请联系管理员",
+                    started_at,
+                    authorized_until,
+                    0,
+                )
+            _journal_append(
+                {
+                    "time": current,
+                    "event": "trial_creation",
+                    "new_until": authorized_until,
+                    "reason": change_reason,
+                }
+            )
             _write_marker()
 
     rollback = current + CLOCK_ROLLBACK_TOLERANCE_SECONDS < last_seen_at
     active = not rollback and current < authorized_until
+    if suspicious:
+        last_journal = _journal_last()
+        if (
+            last_journal is None
+            or last_journal.get("event") != "anomaly_detected"
+            or int(last_journal.get("new_until") or 0) != authorized_until
+        ):
+            _journal_append(
+                {
+                    "time": current,
+                    "event": "anomaly_detected",
+                    "new_until": authorized_until,
+                    "reason": "授权状态异常，已暂停自动写回",
+                    "state_path": str(
+                        canonical_path or _primary_state_path()
+                    ),
+                }
+            )
     if cleared_reset:
         reason = "检测到授权记录被清除，试用已结束；请联系管理员重新验证"
     elif rollback:
         reason = "检测到系统时间回拨，功能已锁定，请联系管理员验证"
+    elif suspicious:
+        reason = "检测到授权状态异常，请核对（已暂停自动写回）"
     elif not active:
         reason = (
             "3天试用期已结束，请联系管理员获取验证码"
@@ -482,16 +893,54 @@ def check_trial(now: int | None = None) -> TrialStatus:
     else:
         reason = ""
 
-    if not _save_state(
-        started_at,
-        max(current, last_seen_at),
-        authorized_until,
-        grant_type,
-        redeemed_codes,
-    ):
-        return TrialStatus(False, "无法保存授权记录，请联系管理员", started_at, authorized_until, 0)
+    if not suspicious and not cleared_reset and current > last_seen_at:
+        saved = _save_state_v3(
+            started_at,
+            current,
+            authorized_until,
+            grant_type,
+            redeemed_codes,
+            grant_source=grant_source or "trial",
+            change_reason=change_reason or "最后在线时间更新",
+            granted_at=granted_at or last_seen_at,
+            migration_id=migration_id or _STATE_MIGRATION_ID,
+            migrated_at=migrated_at,
+            backup_used=backup_used,
+        )
+        if not saved:
+            return TrialStatus(
+                False,
+                "无法保存授权记录，请联系管理员",
+                started_at,
+                authorized_until,
+                0,
+            )
     remaining = max(0, authorized_until - current) if active else 0
-    return TrialStatus(active, reason, started_at, authorized_until, remaining)
+    return TrialStatus(
+        active,
+        reason,
+        started_at,
+        authorized_until,
+        remaining,
+        suspicious=suspicious,
+        source=grant_source or ("trial" if grant_type == "trial" else "admin"),
+        state_path=str(canonical_path or _primary_state_path()),
+        state_version=int((canonical or {}).get("version") or _CURRENT_STATE_VERSION),
+        machine_digest=str((canonical or {}).get("machine") or _machine_digest().hex()),
+        backup_used=backup_used,
+        migration_id=migration_id,
+        last_changed_at=granted_at or last_seen_at,
+        change_reason=change_reason,
+        migrated_at=migrated_at,
+        records_count=len(decoded),
+        info={
+            "authorized_until": authorized_until,
+            "last_seen_at": last_seen_at,
+            "redeemed_code_count": len(redeemed_codes),
+            "rollback": rollback,
+            "cleared_reset": cleared_reset,
+        },
+    )
 
 
 def verify_authorization_code(
@@ -523,30 +972,98 @@ def verify_authorization_code(
         status = check_trial(now=current)
         return False, "验证码有效期异常", status
 
-    _raw, decoded = _records()
-    redeemed_codes = _active_redeemed_codes(decoded, current)
+    if _invalid_state_present():
+        status = check_trial(now=current)
+        return False, "授权记录无效或已被修改，请联系管理员验证", status
+
+    loaded = _load_state_records()
+    canonical_pair = _choose_canonical(loaded) if loaded else None
+    canonical = canonical_pair[1] if canonical_pair else None
+    if canonical is not None:
+        redeemed_codes = {
+            str(code_id): int(expires_at)
+            for code_id, expires_at in (canonical.get("redeemed_codes") or {}).items()
+            if int(expires_at) > current
+        }
+        started_at = min(int(canonical["started_at"]), current)
+        existing_until = int(canonical["authorized_until"])
+    else:
+        redeemed_codes = {}
+        started_at = current
+        existing_until = current
     code_id = hashlib.sha256(token).hexdigest()
     if code_id in redeemed_codes:
         status = check_trial(now=current)
         return False, "该验证码已经使用过，不能重复叠加", status
 
-    started_at = min([int(record["started_at"]) for record in decoded] or [current])
-    existing_until = max([int(record["authorized_until"]) for record in decoded] or [current])
     accumulation_base = max(current, existing_until)
     authorized_until = accumulation_base + authorization_seconds
     redeemed_codes[code_id] = expires_at
-    if not _save_state(
+    grant_source = "activation" if existing_until <= current else "renewal"
+    change_reason = "首次激活验证码" if grant_source == "activation" else "续期验证码"
+    if not _save_state_v3(
         started_at,
         current,
         authorized_until,
         "admin",
         redeemed_codes,
+        grant_source=grant_source,
+        change_reason=change_reason,
+        granted_at=current,
+        migration_id=_STATE_MIGRATION_ID,
     ):
         status = TrialStatus(False, "无法保存授权记录，请联系管理员", started_at, authorized_until, 0)
         return False, status.reason, status
+    _journal_append(
+        {
+            "time": current,
+            "event": grant_source,
+            "old_until": existing_until,
+            "new_until": authorized_until,
+            "reason": change_reason,
+            "code_id": code_id[:12],
+        }
+    )
     status = check_trial(now=current)
     expiry_date = datetime.fromtimestamp(authorized_until).strftime("%Y-%m-%d")
     return True, f"验证成功，授权时间已累计；{remaining_text(status)}，到期 {expiry_date}", status
+
+
+def authorization_info(status: TrialStatus | None = None) -> dict:
+    """Return redacted authorization diagnostics for the settings page."""
+    if status is None:
+        status = check_trial()
+    loaded = _load_state_records()
+    canonical_pair = _choose_canonical(loaded) if loaded else None
+    canonical = canonical_pair[1] if canonical_pair else None
+    expires_at = int(status.expires_at or 0)
+    return {
+        "primary_state_path": str(_primary_state_path()),
+        "state_path": status.state_path or str(_primary_state_path()),
+        "legacy_candidates": [str(path) for path in _legacy_state_candidates()],
+        "records_count": status.records_count or len(loaded),
+        "authorized_until": expires_at,
+        "authorized_until_iso": (
+            datetime.fromtimestamp(expires_at).isoformat() if expires_at else ""
+        ),
+        "remaining_seconds": int(status.remaining_seconds),
+        "started_at": int(status.started_at),
+        "last_seen_at": int((status.info or {}).get("last_seen_at") or status.started_at),
+        "grant_source": status.source,
+        "last_changed_at": int(status.last_changed_at),
+        "change_reason": status.change_reason,
+        "state_version": int(status.state_version),
+        "machine_digest": status.machine_digest,
+        "backup_used": bool(status.backup_used),
+        "migrated_at": int(status.migrated_at),
+        "migration_id": status.migration_id,
+        "suspicious": bool(status.suspicious),
+        "redeemed_code_count": (
+            len(canonical.get("redeemed_codes") or {}) if canonical else 0
+        ),
+        "journal_path": str(_journal_path()),
+        "journal_last": _journal_last(),
+    }
 
 
 def remaining_text(status: TrialStatus) -> str:

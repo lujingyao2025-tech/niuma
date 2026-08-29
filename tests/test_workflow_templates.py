@@ -41,6 +41,7 @@ class WorkflowTemplateBindingTests(unittest.TestCase):
         settings.window_bindings = {
             "7": {"template_name": "话术A", "sender_name": "窗口发件人"}
         }
+        settings.window_sequence = [7]
         workflow = Workflow(db=None, settings=settings)
         subject, body = workflow._render_email_for_task(
             self._task(profile_no=7), "Alex", "Seattle", {}
@@ -75,6 +76,7 @@ class WorkflowTemplateBindingTests(unittest.TestCase):
         settings.window_bindings = {
             "7": {"template_name": "话术A", "sender_name": "窗口发件人"}
         }
+        settings.window_sequence = [7]
         workflow = Workflow(db=None, settings=settings)
         task = self._task(profile_no=7)
         task["sender_name_override"] = "任务发件人"

@@ -86,6 +86,10 @@ class TaskProgressDialog(QDialog):
         self.title_label = QLabel(title)
         self.title_label.setObjectName("sectionTitle")
         layout.addWidget(self.title_label)
+        self.summary_label = QLabel("")
+        self.summary_label.setObjectName("countText")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
         self.detail_label = QLabel("")
         self.detail_label.setObjectName("subtle")
         self.detail_label.setWordWrap(True)
@@ -109,6 +113,28 @@ class TaskProgressDialog(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(self.stop_button)
         layout.addLayout(buttons)
+
+    def update_summary(
+        self,
+        total: int = 0,
+        completed: int = 0,
+        success: int = 0,
+        failed: int = 0,
+        waiting: int = 0,
+        review: int = 0,
+    ) -> None:
+        self.summary_label.setText(
+            tr("总数 {total} · 已完成 {completed} · 成功 {success} · "
+               "失败 {failed} · 等待窗口 {waiting} · 需要人工确认 {review}")
+            .format(
+                total=total,
+                completed=completed,
+                success=success,
+                failed=failed,
+                waiting=waiting,
+                review=review,
+            )
+        )
 
     def _stop(self) -> None:
         self.stop_button.setEnabled(False)

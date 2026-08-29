@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -563,12 +564,18 @@ class WindowPanel(QWidget):
         delete_button = QPushButton(tr("删除行"))
         delete_button.setProperty("class", "danger")
         delete_button.clicked.connect(self.delete_row)
+        move_up_button = QPushButton(tr("上移"))
+        move_up_button.clicked.connect(lambda: self.move_row(-1))
+        move_down_button = QPushButton(tr("下移"))
+        move_down_button.clicked.connect(lambda: self.move_row(1))
         self.save_button = QPushButton(tr("保存窗口顺序"))
         self.save_button.setProperty("class", "primary")
         self.save_button.clicked.connect(self.save_sequence)
         toolbar.addWidget(self.auto_fill_button)
         toolbar.addWidget(add_button)
         toolbar.addWidget(delete_button)
+        toolbar.addWidget(move_up_button)
+        toolbar.addWidget(move_down_button)
         toolbar.addStretch(1)
         toolbar.addWidget(self.save_button)
         layout.addLayout(toolbar)
@@ -578,6 +585,7 @@ class WindowPanel(QWidget):
         self.sequence_table.verticalHeader().setVisible(False)
         self.sequence_table.horizontalHeader().setStretchLastSection(True)
         self.sequence_table.setFixedHeight(260)
+        self.sequence_table.itemChanged.connect(self._on_sequence_item_changed)
         layout.addWidget(self.sequence_table)
 
         note = QLabel(tr("列表顺序就是任务分配顺序；编号锁定后删除任务才能解除。"))
@@ -586,7 +594,7 @@ class WindowPanel(QWidget):
         layout.addWidget(note)
 
         layout.addWidget(self._section_title(tr("窗口绑定（模板与发件人）")))
-        self.bindings_table = QTableWidget(0, 3)
+        self.bindings_table = QTableWidget(0, 4)
         self.bindings_table.setHorizontalHeaderLabels(
             [tr("窗口"), tr("模板"), tr("发件人"), tr("锁定")]
         )
@@ -595,13 +603,18 @@ class WindowPanel(QWidget):
         layout.addWidget(self.bindings_table, 1)
 
         binding_toolbar = QHBoxLayout()
+        self.prune_bindings_button = QPushButton(tr("清理无效绑定"))
+        self.prune_bindings_button.setProperty("class", "danger")
+        self.prune_bindings_button.clicked.connect(self.prune_invalid_bindings)
         self.save_bindings_button = QPushButton(tr("保存窗口绑定"))
         self.save_bindings_button.setProperty("class", "primary")
         self.save_bindings_button.clicked.connect(self.save_bindings)
+        binding_toolbar.addWidget(self.prune_bindings_button)
         binding_toolbar.addStretch(1)
         binding_toolbar.addWidget(self.save_bindings_button)
         layout.addLayout(binding_toolbar)
 
+        self._loading = False
         self.load()
 
     @staticmethod
@@ -611,22 +624,47 @@ class WindowPanel(QWidget):
         return label
 
     def load(self) -> None:
+        self._reload_sequence_table()
+        self._reload_bindings_table()
+
+    def _reload_sequence_table(self) -> None:
         settings = self.window.settings
+        self._loading = True
         self.sequence_table.setRowCount(len(settings.window_sequence))
         for row, profile_no in enumerate(settings.window_sequence):
             self.sequence_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
             self.sequence_table.setItem(row, 1, QTableWidgetItem(str(profile_no)))
+        self._loading = False
 
+    def sync_after_sequence_change(self) -> None:
+        """Refresh sequence rows from settings while keeping live binding edits."""
+        self._reload_sequence_table()
+        self.refresh_preserving()
+
+    def _reload_bindings_table(self) -> None:
+        settings = self.window.settings
         template_names = [str(item.get("name") or "") for item in settings.saved_templates]
         bindings = settings.window_bindings
-        self.bindings_table.setRowCount(len(bindings))
-        for row, (profile_no, binding) in enumerate(sorted(bindings.items(), key=lambda item: int(item[0]))):
+        all_windows = [str(window) for window in settings.window_sequence]
+        self.bindings_table.setRowCount(len(all_windows))
+        for row, profile_no in enumerate(all_windows):
+            binding = bindings.get(str(profile_no), {})
             self.bindings_table.setItem(row, 0, QTableWidgetItem(str(profile_no)))
             template_cell = QComboBox()
             template_cell.addItem("", "")
             for name in template_names:
                 template_cell.addItem(name, name)
-            template_cell.setCurrentText(str(binding.get("template_name") or ""))
+            selected_name = str(binding.get("template_name") or "")
+            if selected_name and selected_name not in template_names:
+                template_cell.addItem(
+                    tr("模板已删除/失效：{name}").format(name=selected_name),
+                    selected_name,
+                )
+            template_cell.setCurrentText(
+                tr("模板已删除/失效：{name}").format(name=selected_name)
+                if selected_name and selected_name not in template_names
+                else selected_name
+            )
             sender_cell = QLineEdit(str(binding.get("sender_name") or ""))
             lock_cell = QCheckBox()
             lock_cell.setChecked(bool(binding.get("locked")))
@@ -634,6 +672,77 @@ class WindowPanel(QWidget):
             self.bindings_table.setCellWidget(row, 1, template_cell)
             self.bindings_table.setCellWidget(row, 2, sender_cell)
             self.bindings_table.setCellWidget(row, 3, lock_cell)
+
+    def _sequence_numbers(self) -> list[int]:
+        values: list[str] = []
+        for row in range(self.sequence_table.rowCount()):
+            item = self.sequence_table.item(row, 1)
+            values.append(item.text().strip() if item is not None else "")
+        return normalize_window_sequence(values)
+
+    def _sync_bindings_from_sequence(self) -> None:
+        """Keep the binding table in sync with the sequence table without saving."""
+        try:
+            sequence = self._sequence_numbers()
+        except ValueError:
+            return
+        self.window.settings.window_sequence = sequence
+        self.refresh_preserving()
+
+    def _on_sequence_item_changed(self, item) -> None:
+        if self._loading or item.column() != 1:
+            return
+        self._sync_bindings_from_sequence()
+
+    def refresh_preserving(self) -> None:
+        """Reload template names while keeping each window's live selection."""
+        previous: dict[str, dict] = {}
+        for row in range(self.bindings_table.rowCount()):
+            profile_item = self.bindings_table.item(row, 0)
+            if profile_item is None:
+                continue
+            template_cell = self.bindings_table.cellWidget(row, 1)
+            sender_cell = self.bindings_table.cellWidget(row, 2)
+            lock_cell = self.bindings_table.cellWidget(row, 3)
+            previous[str(profile_item.text().strip())] = {
+                "template": (
+                    str(template_cell.currentData() or "")
+                    if isinstance(template_cell, QComboBox)
+                    else ""
+                ),
+                "sender": (
+                    sender_cell.text()
+                    if isinstance(sender_cell, QLineEdit)
+                    else ""
+                ),
+                "locked": (
+                    bool(lock_cell.isChecked())
+                    if isinstance(lock_cell, QCheckBox)
+                    else False
+                ),
+            }
+        self._reload_bindings_table()
+        for row in range(self.bindings_table.rowCount()):
+            profile_item = self.bindings_table.item(row, 0)
+            if profile_item is None:
+                continue
+            state = previous.get(str(profile_item.text().strip()))
+            if state is None:
+                continue
+            template_cell = self.bindings_table.cellWidget(row, 1)
+            sender_cell = self.bindings_table.cellWidget(row, 2)
+            lock_cell = self.bindings_table.cellWidget(row, 3)
+            if isinstance(template_cell, QComboBox):
+                template_value = state["template"]
+                index = template_cell.findData(template_value)
+                if index < 0 and not template_value:
+                    index = 0
+                if index >= 0:
+                    template_cell.setCurrentIndex(index)
+            if isinstance(sender_cell, QLineEdit):
+                sender_cell.setText(state["sender"])
+            if isinstance(lock_cell, QCheckBox):
+                lock_cell.setChecked(state["locked"])
 
     def add_row(self) -> None:
         row = self.sequence_table.rowCount()
@@ -643,35 +752,65 @@ class WindowPanel(QWidget):
         self.sequence_table.insertRow(row)
         self.sequence_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
         self.sequence_table.setItem(row, 1, QTableWidgetItem(""))
+        self._sync_bindings_from_sequence()
         self.sequence_table.editItem(self.sequence_table.item(row, 1))
 
     def delete_row(self) -> None:
+        if not self.sequence_table.selectedIndexes():
+            QMessageBox.warning(self, tr("未选择行"), tr("请先选择要删除的窗口行。"))
+            return
         rows = sorted({index.row() for index in self.sequence_table.selectedIndexes()}, reverse=True)
         for row in rows:
             self.sequence_table.removeRow(row)
         for row in range(self.sequence_table.rowCount()):
             self.sequence_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+        self._sync_bindings_from_sequence()
+
+    def move_row(self, direction: int) -> None:
+        indexes = self.sequence_table.selectedIndexes()
+        if not indexes:
+            QMessageBox.warning(self, tr("未选择行"), tr("请先选择要移动的窗口行。"))
+            return
+        row = sorted({index.row() for index in indexes})[0]
+        target = row + direction
+        if target < 0 or target >= self.sequence_table.rowCount():
+            return
+        for column in range(self.sequence_table.columnCount()):
+            source_item = self.sequence_table.takeItem(row, column)
+            target_item = self.sequence_table.takeItem(target, column)
+            self.sequence_table.setItem(row, column, target_item)
+            self.sequence_table.setItem(target, column, source_item)
+        for index in range(self.sequence_table.rowCount()):
+            order_item = self.sequence_table.item(index, 0)
+            if order_item is not None:
+                order_item.setText(str(index + 1))
+        self.sequence_table.selectRow(target)
+        self._sync_bindings_from_sequence()
 
     def save_sequence(self) -> None:
-        values: list[str] = []
-        for row in range(self.sequence_table.rowCount()):
-            item = self.sequence_table.item(row, 1)
-            values.append(item.text().strip() if item is not None else "")
         try:
-            normalized = normalize_window_sequence(values)
+            normalized = self._sequence_numbers()
         except ValueError as exc:
             QMessageBox.warning(self, tr("窗口顺序无效"), str(exc))
             return
-        self.window.settings.window_sequence = normalized
-        self.window.settings.save()
-        self.window.set_status(tr("窗口顺序已保存"))
-        self.load()
+        try:
+            self.window.settings.save_window_sequence(normalized)
+        except Exception as exc:
+            self.window.show_error(tr("窗口顺序保存失败"), str(exc))
+            return
+        detail = "、".join(str(number) for number in normalized)
+        self.window.set_status(tr("窗口顺序已保存：{detail}").format(detail=detail))
+        self.sync_after_sequence_change()
 
     def save_bindings(self) -> None:
         bindings: dict[str, dict] = {}
+        current_windows = {str(number) for number in self.window.settings.window_sequence}
         for row in range(self.bindings_table.rowCount()):
             profile_item = self.bindings_table.item(row, 0)
-            if profile_item is None or not profile_item.text().strip():
+            if profile_item is None:
+                continue
+            window = str(profile_item.text().strip())
+            if window not in current_windows:
                 continue
             template_cell = self.bindings_table.cellWidget(row, 1)
             sender_cell = self.bindings_table.cellWidget(row, 2)
@@ -681,14 +820,55 @@ class WindowPanel(QWidget):
                 template_name = str(template_cell.currentData() or "")
             sender_name = sender_cell.text().strip() if isinstance(sender_cell, QLineEdit) else ""
             locked = bool(lock_cell.isChecked()) if isinstance(lock_cell, QCheckBox) else False
-            bindings[str(profile_item.text().strip())] = {
+            bindings[window] = {
                 "template_name": template_name,
                 "sender_name": sender_name,
                 "locked": locked,
             }
-        self.window.settings.window_bindings = bindings
-        self.window.settings.save()
-        self.window.set_status(tr("窗口绑定已保存"))
+        try:
+            self.window.settings.merge_window_bindings(bindings)
+        except Exception as exc:
+            self.window.show_error(tr("窗口绑定保存失败"), str(exc))
+            return
+        self.window.set_status(
+            tr("窗口绑定已保存，共 {count} 个窗口。").format(count=len(bindings))
+        )
+
+    def prune_invalid_bindings(self) -> None:
+        settings = self.window.settings
+        current = {str(number) for number in settings.window_sequence}
+        stale = [
+            str(window)
+            for window in settings.window_bindings
+            if str(window) not in current
+        ]
+        if not stale:
+            QMessageBox.information(
+                self,
+                tr("清理无效绑定"),
+                tr("当前没有需要清理的历史绑定。"),
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            tr("清理无效绑定"),
+            tr("将永久删除 {count} 个已关闭/不在窗口顺序中的绑定。\n"
+               "当前窗口的模板、发件人和锁定状态不会改变。")
+            .format(count=len(stale)),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            removed = settings.prune_window_bindings(current)
+        except Exception as exc:
+            self.window.show_error(tr("清理无效绑定失败"), str(exc))
+            return
+        self.refresh_preserving()
+        self.window.set_status(
+            tr("已清理 {count} 个无效绑定。").format(count=removed)
+        )
 
 
 class TaskInspector(QWidget):
@@ -881,3 +1061,105 @@ class TaskInspector(QWidget):
         self.progress.setValue(max(0, min(100, value)))
         if text:
             self.operation_status.setText(text)
+
+
+class CollapsibleDetails(QWidget):
+    """Collapsible right details panel with persisted width and state."""
+
+    def __init__(
+        self,
+        inspector: TaskInspector,
+        settings_store,
+        state_key: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.inspector = inspector
+        self.settings_store = settings_store
+        self.state_key = state_key
+        self._expanded = bool(
+            settings_store.value(f"{state_key}_expanded", False, type=bool)
+        )
+        self._saved_width = int(
+            settings_store.value(f"{state_key}_width", 340, type=int)
+        )
+        self._visible_override: bool | None = None
+        self.splitter: QSplitter | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.toggle_button = QToolButton()
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setText(tr("详情"))
+        self.toggle_button.setFixedHeight(30)
+        self.toggle_button.clicked.connect(self.set_expanded)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(inspector, 1)
+        self._apply_state()
+
+    def _apply_state(self) -> None:
+        visible = (
+            self._visible_override
+            if self._visible_override is not None
+            else self._expanded
+        )
+        if visible:
+            self.inspector.setVisible(True)
+            self.setMinimumWidth(300)
+            self.setMaximumWidth(420)
+            self._restore_width()
+        else:
+            self.inspector.setVisible(False)
+            self.setMinimumWidth(36)
+            self.setMaximumWidth(36)
+            self.setFixedWidth(36)
+        self.toggle_button.setChecked(visible)
+        self.toggle_button.setArrowType(
+            Qt.LeftArrow if visible else Qt.RightArrow
+        )
+        self.setVisible(True)
+
+    def _restore_width(self) -> None:
+        if not self._expanded or self.splitter is None:
+            return
+        width = max(300, min(420, self._saved_width))
+        splitter_width = max(0, self.splitter.width())
+        left = max(300, splitter_width - width)
+        self.splitter.setSizes([left, width])
+
+    def restore_width(self) -> None:
+        self._restore_width()
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self._apply_state()
+        self._restore_width()
+        self.settings_store.setValue(
+            f"{self.state_key}_expanded", self._expanded
+        )
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def saved_width(self) -> int:
+        return self._saved_width
+
+    def auto_show(self) -> None:
+        if self._visible_override is not False:
+            self.set_expanded(True)
+
+    def set_visible_override(self, visible: bool | None) -> None:
+        self._visible_override = None if visible is None else bool(visible)
+        self._apply_state()
+
+    def save_width(self, width: int) -> None:
+        if not self._expanded:
+            return
+        width = int(width)
+        if width < 300:
+            width = 300
+        self._saved_width = min(420, width)
+        self.settings_store.setValue(
+            f"{self.state_key}_width", self._saved_width
+        )

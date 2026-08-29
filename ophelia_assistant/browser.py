@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import time
@@ -21,6 +22,7 @@ from playwright.sync_api import (
 from .config import app_data_dir
 from .gmail_utils import RECIPIENT_LABEL_RE, SUBJECT_LABEL_RE, gmail_new_message_url
 from .operation import check_cancel
+from .timing import StageTimer
 
 
 class BrowserAutomationError(RuntimeError):
@@ -70,8 +72,11 @@ def _compose_page(browser: Browser) -> Page | None:
 def _gmail_page(browser: Browser) -> Page:
     page = _matching_page(browser, "mail.google.com") or _context(browser).new_page()
     if "mail.google.com" not in page.url:
-        page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(800)
+        page.goto(
+            "https://mail.google.com/mail/u/0/#inbox",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
     if "accounts.google.com" in page.url:
         raise BrowserAutomationError("此浏览器窗口尚未登录 Gmail")
     return page
@@ -82,15 +87,35 @@ def _visible_last(
     timeout_ms: int = 15000,
     cancel_event: threading.Event | None = None,
 ) -> Locator | None:
+    """Return the last visible match using state waits instead of fixed sleeps."""
     elapsed = 0
+    try:
+        locator.last.wait_for(
+            state="visible",
+            timeout=min(2000, timeout_ms),
+        )
+    except (PlaywrightTimeoutError, PlaywrightError):
+        pass
     while elapsed <= timeout_ms:
         check_cancel(cancel_event)
         for index in range(locator.count() - 1, -1, -1):
             candidate = locator.nth(index)
-            if candidate.is_visible():
-                return candidate
-        time.sleep(0.25)
-        elapsed += 250
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except PlaywrightError:
+                continue
+        remaining = timeout_ms - elapsed
+        if remaining <= 0:
+            break
+        try:
+            locator.last.wait_for(
+                state="visible",
+                timeout=min(1000, remaining),
+            )
+        except (PlaywrightTimeoutError, PlaywrightError):
+            pass
+        elapsed += min(1000, remaining)
     return None
 
 
@@ -100,6 +125,13 @@ def _visible_largest(
     cancel_event: threading.Event | None = None,
 ) -> Locator | None:
     """Return the largest visible match, which is Gmail's message body fallback."""
+    try:
+        locator.first.wait_for(
+            state="visible",
+            timeout=min(1500, timeout_ms),
+        )
+    except (PlaywrightTimeoutError, PlaywrightError):
+        pass
     elapsed = 0
     while elapsed <= timeout_ms:
         check_cancel(cancel_event)
@@ -107,9 +139,16 @@ def _visible_largest(
         largest_area = -1.0
         for index in range(locator.count()):
             candidate = locator.nth(index)
-            if not candidate.is_visible():
+            try:
+                visible = candidate.is_visible()
+            except PlaywrightError:
                 continue
-            box = candidate.bounding_box()
+            if not visible:
+                continue
+            try:
+                box = candidate.bounding_box()
+            except PlaywrightError:
+                continue
             if not box:
                 continue
             area = box["width"] * box["height"]
@@ -118,8 +157,17 @@ def _visible_largest(
                 largest_area = area
         if largest is not None:
             return largest
-        time.sleep(0.25)
-        elapsed += 250
+        remaining = timeout_ms - elapsed
+        if remaining <= 0:
+            break
+        try:
+            locator.first.wait_for(
+                state="visible",
+                timeout=min(1000, remaining),
+            )
+        except (PlaywrightTimeoutError, PlaywrightError):
+            pass
+        elapsed += min(1000, remaining)
     return None
 
 
@@ -129,26 +177,49 @@ def _visible_inputs_by_position(
     cancel_event: threading.Event | None = None,
 ) -> list[Locator]:
     """Find visible compose inputs from top to bottom for geometry fallback."""
+    locator = scope.locator(
+        'input:not([type="hidden"]):not([disabled]), textarea:not([disabled])'
+    )
+    try:
+        locator.first.wait_for(
+            state="visible",
+            timeout=min(1200, timeout_ms),
+        )
+    except (PlaywrightTimeoutError, PlaywrightError):
+        pass
     elapsed = 0
     while elapsed <= timeout_ms:
         check_cancel(cancel_event)
         found: list[tuple[float, float, Locator]] = []
-        locator = scope.locator(
-            'input:not([type="hidden"]):not([disabled]), textarea:not([disabled])'
-        )
         for index in range(locator.count()):
             candidate = locator.nth(index)
-            if not candidate.is_visible():
+            try:
+                visible = candidate.is_visible()
+            except PlaywrightError:
                 continue
-            box = candidate.bounding_box()
+            if not visible:
+                continue
+            try:
+                box = candidate.bounding_box()
+            except PlaywrightError:
+                continue
             if not box or box["width"] < 20 or box["height"] < 10:
                 continue
             found.append((box["y"], box["x"], candidate))
         if found:
             found.sort(key=lambda item: (item[0], item[1]))
             return [item[2] for item in found]
-        time.sleep(0.25)
-        elapsed += 250
+        remaining = timeout_ms - elapsed
+        if remaining <= 0:
+            break
+        try:
+            locator.first.wait_for(
+                state="visible",
+                timeout=min(1000, remaining),
+            )
+        except (PlaywrightTimeoutError, PlaywrightError):
+            pass
+        elapsed += min(1000, remaining)
     return []
 
 
@@ -182,20 +253,31 @@ def _replace_compose_body(
     page.keyboard.press("Control+A")
     page.keyboard.press("Backspace")
     page.keyboard.insert_text(body)
-    page.wait_for_timeout(200)
     check_cancel(cancel_event)
 
     # Read through DOM evaluation instead of Locator.inner_text(). Gmail may
     # visually accept all text while inner_text still waits for actionability
     # and eventually reports a false timeout.
+    current_text = ""
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        check_cancel(cancel_event)
+        try:
+            current_text = body_box.evaluate(
+                "element => element.innerText || element.textContent || ''"
+            )
+        except PlaywrightError:
+            current_text = ""
+        if marker and marker in str(current_text):
+            break
+        page.wait_for_timeout(100)
+    check_cancel(cancel_event)
     try:
         current_text = body_box.evaluate(
             "element => element.innerText || element.textContent || ''"
         )
     except PlaywrightError:
-        # Keyboard insertion completed without error. If Gmail is temporarily
-        # replacing the editor node, keep the visible draft and avoid a false popup.
-        return
+        current_text = ""
     if marker and marker in str(current_text):
         return
 
@@ -214,10 +296,19 @@ def _replace_compose_body(
             }""",
             body,
         )
-        page.wait_for_timeout(200)
-        current_text = body_box.evaluate(
-            "element => element.innerText || element.textContent || ''"
-        )
+        deadline = time.monotonic() + 2
+        current_text = ""
+        while time.monotonic() < deadline:
+            check_cancel(cancel_event)
+            try:
+                current_text = body_box.evaluate(
+                    "element => element.innerText || element.textContent || ''"
+                )
+            except PlaywrightError:
+                current_text = ""
+            if marker and marker in str(current_text):
+                break
+            page.wait_for_timeout(100)
     except PlaywrightError:
         # The first keyboard strategy already completed; a DOM replacement
         # during secondary verification must not turn success into an error.
@@ -344,6 +435,169 @@ def _subject_control(
     return non_recipient[-1] if len(inputs) >= 2 and non_recipient else None
 
 
+def _locator_input_values(locator: Locator) -> list[str]:
+    values: list[str] = []
+    try:
+        count = locator.count()
+    except PlaywrightError:
+        return values
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if not candidate.is_visible():
+                continue
+            value = str(candidate.input_value(timeout=800) or "").strip()
+        except (PlaywrightError, PlaywrightTimeoutError):
+            continue
+        if value:
+            values.append(value)
+    return values
+
+
+def _locator_texts(locator: Locator) -> list[str]:
+    values: list[str] = []
+    try:
+        count = locator.count()
+    except PlaywrightError:
+        return values
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if not candidate.is_visible():
+                continue
+            text = str(candidate.inner_text(timeout=800) or "").strip()
+            if not text:
+                text = str(candidate.text_content(timeout=800) or "").strip()
+        except (PlaywrightError, PlaywrightTimeoutError):
+            continue
+        if text:
+            values.append(text)
+    return values
+
+
+def _locator_attributes(locator: Locator, names: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    try:
+        count = locator.count()
+    except PlaywrightError:
+        return values
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if not candidate.is_visible():
+                continue
+            for name in names:
+                value = str(candidate.get_attribute(name, timeout=500) or "").strip()
+                if value:
+                    values.append(value)
+        except (PlaywrightError, PlaywrightTimeoutError):
+            continue
+    return values
+
+
+def _read_draft_fields(
+    page: Page,
+    scope: Locator | None = None,
+) -> dict:
+    """Read recipient chips/inputs, subject and body using primary selectors."""
+    scope = scope or _compose_scope(page)
+    recipient_sources: list[str] = []
+    recipient_sources.extend(
+        _locator_input_values(
+            scope.locator(
+                'input[name="to"], textarea[name="to"], '
+                'input[peoplekit-id], input[aria-label*="recipient" i], '
+                'input[aria-label*="收件人"], input[aria-label*="收件者"]'
+            )
+        )
+    )
+    chip_locator = scope.locator(
+        'div[role="chip"], div[role="button"][data-hovercard-id], '
+        '[data-hovercard-id], [data-email], [email]'
+    )
+    recipient_sources.extend(_locator_texts(chip_locator))
+    recipient_sources.extend(
+        _locator_attributes(
+            chip_locator,
+            (
+                "data-hovercard-id",
+                "data-email",
+                "email",
+                "aria-label",
+            ),
+        )
+    )
+    recipient_emails = sorted(
+        {
+            email.casefold()
+            for value in recipient_sources
+            for email in re.findall(r"[\w.+-]+@[\w.-]+", str(value or ""))
+        }
+    )
+
+    subject_values = _locator_input_values(
+        scope.locator(
+            'input[name="subjectbox"], input[name="subject"], '
+            'input[aria-label="Subject" i], input[aria-label*="主题"], '
+            'input[aria-label*="主旨"]'
+        )
+    )
+    subject = " ".join(subject_values).strip() if subject_values else ""
+
+    body_selectors = (
+        'div[contenteditable="true"][aria-label*="Message Body" i], '
+        'div[contenteditable="true"][aria-label*="邮件正文"], '
+        'div[contenteditable="true"][aria-label*="郵件正文"], '
+        'div[contenteditable="true"][role="textbox"]'
+    )
+    body_values = _locator_texts(scope.locator(body_selectors))
+    body = "\n".join(body_values).strip() if body_values else ""
+
+    return {
+        "recipients": recipient_emails,
+        "subject": subject,
+        "body": body,
+        "recipient_read": bool(recipient_sources),
+        "subject_read": bool(subject_values),
+        "body_read": bool(body_values),
+        "compose_found": bool(recipient_sources or subject_values or body_values),
+    }
+
+
+def _existing_blank_compose(
+    browser: Browser,
+    page: Page,
+    cancel_event: threading.Event | None = None,
+) -> Page | None:
+    """Reuse an already open blank compose; never overwrite a nonblank draft."""
+    compose_page = _compose_page(browser)
+    candidates = []
+    if compose_page is not None:
+        candidates.append(compose_page)
+    if page.url and ("view=cm" in page.url or "compose" in page.url or "to=" in page.url):
+        candidates.append(page)
+    dialog = _compose_scope(page, cancel_event)
+    if dialog is not None and dialog.locator('div[role="dialog"]').count() > 0:
+        candidates.append(page)
+    seen: set[int] = set()
+    for candidate in candidates:
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        try:
+            fields = _read_draft_fields(candidate)
+        except PlaywrightError:
+            continue
+        if (
+            fields.get("compose_found")
+            and not fields.get("recipients")
+            and not fields.get("subject")
+            and not fields.get("body")
+        ):
+            return candidate
+    return None
+
+
 def _fill_open_compose(
     page: Page,
     recipient: str,
@@ -351,6 +605,7 @@ def _fill_open_compose(
     body: str,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    timer: StageTimer | None = None,
 ) -> int:
     check_cancel(cancel_event)
     dialog = _visible_last(
@@ -366,21 +621,35 @@ def _fill_open_compose(
             "Gmail 写信窗口未出现，可能在新标签页打开，或 Gmail 页面仍在加载"
         )
     scope = dialog if dialog is not None else page.locator("body")
-    _notify(progress, 0, "已打开写信窗口，正在定位收件人")
+    _notify(progress, 0, "定位收件人输入框")
 
+    if timer is not None:
+        timer.next("locate_recipient")
     to_box = _recipient_control(scope, cancel_event)
+    if timer is not None:
+        timer.stop("locate_recipient")
     if to_box is None:
         raise BrowserAutomationError("已打开写信窗口，多种策略均找不到 To / 收件人输入框")
+    if timer is not None:
+        timer.next("fill_recipient")
     _replace_text_control(page, to_box, recipient, "收件人", cancel_event)
     to_box.press("Enter")
-    _notify(progress, 33, "收件人已填写并验证")
+    if timer is not None:
+        timer.stop("fill_recipient")
+    _notify(progress, 33, "填写收件人")
 
+    if timer is not None:
+        timer.next("fill_subject")
     subject_box = _subject_control(scope, cancel_event)
     if subject_box is None:
         raise BrowserAutomationError("收件人已填写，多种策略均找不到 Subject / 主题输入框")
     _replace_text_control(page, subject_box, subject, "主题", cancel_event)
-    _notify(progress, 67, "收件人和主题已填写并验证")
+    if timer is not None:
+        timer.stop("fill_subject")
+    _notify(progress, 67, "填写主题")
 
+    if timer is not None:
+        timer.next("fill_body")
     body_box = _visible_largest(scope.locator(
         'div[contenteditable="true"][aria-label*="Message Body" i], '
         'div[contenteditable="true"][aria-label*="邮件正文"], '
@@ -406,16 +675,27 @@ def _fill_open_compose(
             raise BrowserAutomationError("已填写收件人和主题，但找不到正文大输入框（第三个输入区）")
         body_prompt.click()
         page.keyboard.insert_text(body)
-        page.wait_for_timeout(200)
-        try:
-            scope_text = scope.evaluate(
-                "element => element.innerText || element.textContent || ''"
-            )
-        except PlaywrightError:
-            scope_text = None
-        if scope_text is not None and body.splitlines()[0].strip() not in str(scope_text):
+        deadline = time.monotonic() + 2
+        scope_text = ""
+        while time.monotonic() < deadline:
+            check_cancel(cancel_event)
+            try:
+                scope_text = str(
+                    scope.evaluate(
+                        "element => element.innerText || element.textContent || ''"
+                    )
+                    or ""
+                )
+            except PlaywrightError:
+                scope_text = ""
+            if body.splitlines()[0].strip() in scope_text:
+                break
+            page.wait_for_timeout(100)
+        if body.splitlines()[0].strip() not in scope_text:
             raise BrowserAutomationError("正文区域已点击，但页面回读未检测到邮件内容")
-    _notify(progress, 100, "收件人、主题和正文均已验证")
+    if timer is not None:
+        timer.stop("fill_body")
+    _notify(progress, 100, "填写正文")
     return 100
 
 
@@ -451,7 +731,7 @@ def _open_compose_by_button(
         compose_page = _compose_page(browser)
         if compose_page is not None and compose_page != page:
             return compose_page
-        time.sleep(0.25)
+        time.sleep(0.1)
     return page
 
 
@@ -516,25 +796,34 @@ def _prepare_gmail_draft_on_page(
     body: str,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    timer: StageTimer | None = None,
 ) -> int:
     check_cancel(cancel_event)
     if not recipient.strip() or "@" not in recipient:
         raise BrowserAutomationError("收件邮箱无效")
     if not subject.strip() or not body.strip():
         raise BrowserAutomationError("邮件主题或正文为空")
-    _notify(progress, 0, "正在打开 Gmail 写信窗口")
-    try:
-        page = _open_compose_by_button(browser, page, cancel_event)
-    except (PlaywrightTimeoutError, BrowserAutomationError):
+    _notify(progress, 0, "打开Compose")
+    if timer is not None:
+        timer.next("open_compose")
+    reused = _existing_blank_compose(browser, page, cancel_event)
+    if reused is not None:
+        page = reused
+    else:
         try:
-            page.goto(gmail_new_message_url(), wait_until="domcontentloaded", timeout=60000)
-            if "accounts.google.com" in page.url:
-                raise BrowserAutomationError("此浏览器窗口尚未登录 Gmail")
-        except (PlaywrightTimeoutError, BrowserAutomationError) as exc:
-            raise BrowserAutomationError(f"无法打开 Gmail 写信窗口：{exc}") from exc
+            page = _open_compose_by_button(browser, page, cancel_event)
+        except (PlaywrightTimeoutError, BrowserAutomationError):
+            try:
+                page.goto(gmail_new_message_url(), wait_until="domcontentloaded", timeout=60000)
+                if "accounts.google.com" in page.url:
+                    raise BrowserAutomationError("此浏览器窗口尚未登录 Gmail")
+            except (PlaywrightTimeoutError, BrowserAutomationError) as exc:
+                raise BrowserAutomationError(f"无法打开 Gmail 写信窗口：{exc}") from exc
+    if timer is not None:
+        timer.stop("open_compose")
     try:
         accuracy = _fill_open_compose(
-            page, recipient, subject, body, progress, cancel_event
+            page, recipient, subject, body, progress, cancel_event, timer
         )
     except (PlaywrightTimeoutError, BrowserAutomationError) as exc:
         # Do not open another compose window after partial input. Keeping the
@@ -552,12 +841,25 @@ def prepare_gmail_draft(
     body: str,
     progress: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    timer: StageTimer | None = None,
 ) -> int:
     check_cancel(cancel_event)
+    _notify(progress, 0, "打开Gmail")
+    if timer is not None:
+        timer.begin("open_gmail")
     page = _gmail_page(browser)
+    if timer is not None:
+        timer.stop("open_gmail")
     try:
         return _prepare_gmail_draft_on_page(
-            browser, page, recipient, subject, body, progress, cancel_event
+            browser,
+            page,
+            recipient,
+            subject,
+            body,
+            progress,
+            cancel_event,
+            timer,
         )
     except Exception as exc:
         shot = _save_failure_screenshot(page, "gmail_draft")
@@ -571,46 +873,104 @@ def verify_draft_fields(
     recipient: str,
     subject: str,
     body: str,
-) -> bool:
-    """Re-read the open compose controls and compare full field values."""
-    def _emails(value: str) -> set[str]:
-        return set(re.findall(r"[\w.+-]+@[\w.-]+", str(value or "").casefold()))
+    timer: StageTimer | None = None,
+) -> dict:
+    """Re-read the open compose and return a structured verification result."""
+    if timer is not None:
+        timer.next("validate")
+    expected_emails = sorted(
+        {
+            email.casefold()
+            for email in re.findall(
+                r"[\w.+-]+@[\w.-]+",
+                str(recipient or ""),
+            )
+        }
+    )
 
     def _norm(value: str) -> str:
-        return " ".join(str(value or "").split()).casefold()
+        text = str(value or "")
+        text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+        text = re.sub(r"[ \t\r\n]+", " ", text)
+        return text.strip().casefold()
 
     try:
         page = _compose_page(browser) or _gmail_page(browser)
-        scope = _compose_scope(page)
-        recipient_value = scope.locator(
-            'input[name="to"], textarea[name="to"]'
-        ).last.input_value()
-        subject_value = scope.locator(
-            'input[name="subjectbox"], input[name="subject"]'
-        ).last.input_value()
-        body_value = scope.locator(
-            'div[contenteditable="true"][role="textbox"], '
-            'div[aria-label*="Message Body" i], '
-            'div[aria-label*="邮件正文" i], '
-            'div[aria-label*="郵件正文" i]'
-        ).last.inner_text()
+        fields = _read_draft_fields(page)
     except (PlaywrightError, BrowserAutomationError):
-        return False
-    return (
-        bool(recipient_value)
-        and _emails(recipient) == _emails(recipient_value)
-        and _norm(subject_value) == _norm(subject)
-        and _norm(body_value) == _norm(body)
+        fields = {
+            "recipients": [],
+            "subject": "",
+            "body": "",
+            "recipient_read": False,
+            "subject_read": False,
+            "body_read": False,
+            "compose_found": False,
+        }
+
+    actual_emails = sorted(set(fields.get("recipients") or []))
+    recipient_ok = bool(expected_emails) and set(expected_emails) == set(actual_emails)
+    normalized_subject = _norm(fields.get("subject"))
+    normalized_expected_subject = _norm(subject)
+    subject_ok = bool(fields.get("subject_read")) and normalized_subject == normalized_expected_subject
+    normalized_body = _norm(fields.get("body"))
+    normalized_expected_body = _norm(body)
+    body_ok = bool(fields.get("body_read")) and normalized_body == normalized_expected_body
+    unreadable = not (
+        fields.get("recipient_read")
+        and fields.get("subject_read")
+        and fields.get("body_read")
     )
+    result = {
+        "ok": recipient_ok and subject_ok and body_ok,
+        "unreadable": unreadable,
+        "recipient": {
+            "ok": recipient_ok,
+            "readable": bool(fields.get("recipient_read")),
+            "expected": expected_emails,
+            "actual": actual_emails,
+            "expected_display": ", ".join(expected_emails),
+            "actual_display": ", ".join(actual_emails),
+        },
+        "subject": {
+            "ok": subject_ok,
+            "readable": bool(fields.get("subject_read")),
+            "expected": str(subject or ""),
+            "actual": str(fields.get("subject") or ""),
+            "expected_hash": hashlib.sha256(
+                normalized_expected_subject.encode("utf-8")
+            ).hexdigest(),
+            "actual_hash": hashlib.sha256(
+                normalized_subject.encode("utf-8")
+            ).hexdigest(),
+        },
+        "body": {
+            "ok": body_ok,
+            "readable": bool(fields.get("body_read")),
+            "expected_hash": hashlib.sha256(
+                normalized_expected_body.encode("utf-8")
+            ).hexdigest(),
+            "actual_hash": hashlib.sha256(
+                normalized_body.encode("utf-8")
+            ).hexdigest(),
+            "summary": str(fields.get("body") or "")[:200],
+        },
+    }
+    if timer is not None:
+        timer.stop("validate")
+    return result
 
 
 def click_gmail_send(
     browser: Browser,
     cancel_event: threading.Event | None = None,
+    timer: StageTimer | None = None,
 ) -> None:
     """Click the Gmail compose Send button inside the active compose only."""
     page = _compose_page(browser) or _gmail_page(browser)
     scope = _compose_scope(page, cancel_event)
+    if timer is not None:
+        timer.next("locate_send")
     deadline = time.monotonic() + 12
     last_error = ""
     while time.monotonic() < deadline:
@@ -624,17 +984,32 @@ def click_gmail_send(
                 )
             )
             for locator in locators:
+                try:
+                    locator.last.wait_for(
+                        state="visible",
+                        timeout=min(
+                            1200,
+                            max(0, int((deadline - time.monotonic()) * 1000)),
+                        ),
+                    )
+                except (PlaywrightTimeoutError, PlaywrightError):
+                    pass
                 for index in range(locator.count() - 1, -1, -1):
                     candidate = locator.nth(index)
                     try:
                         if candidate.is_visible() and candidate.is_enabled():
-                            candidate.click()
+                            if timer is not None:
+                                timer.stop("locate_send")
+                                timer.next("click_send")
+                            candidate.click(timeout=3000)
+                            if timer is not None:
+                                timer.stop("click_send")
                             return
                     except PlaywrightError as exc:
                         last_error = str(exc)
         except PlaywrightError as exc:
             last_error = str(exc)
-        time.sleep(0.3)
+        time.sleep(0.15)
     raise BrowserAutomationError(
         f"找不到可用的 Gmail 发送按钮，未自动发送（{last_error or '按钮不可见'}）"
     )
@@ -645,12 +1020,25 @@ def wait_for_gmail_send(
     timeout_ms: int = 300_000,
     cancel_event: threading.Event | None = None,
     baseline: tuple[str, ...] | None = None,
+    timer: StageTimer | None = None,
 ) -> None:
     """Wait until Gmail shows a NEW send toast; old toasts must be cleared first."""
+    if timer is not None:
+        timer.next("wait_send")
     page = _compose_page(browser) or _gmail_page(browser)
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
+        try:
+            page.locator('[role="alert"]').last.wait_for(
+                state="visible",
+                timeout=min(
+                    2000,
+                    max(0, int((deadline - time.monotonic()) * 1000)),
+                ),
+            )
+        except (PlaywrightTimeoutError, PlaywrightError):
+            pass
         try:
             alerts = page.locator('[role="alert"]').all_inner_texts()
         except PlaywrightError:
@@ -662,8 +1050,12 @@ def wait_for_gmail_send(
                     f"Gmail 提示发送失败：{alert_text[:200]}"
                 )
             if SUCCESS_PROMPT_RE.search(alert_text):
+                if timer is not None:
+                    timer.stop("wait_send")
                 return
-        time.sleep(1)
+        time.sleep(0.5)
+    if timer is not None:
+        timer.stop("wait_send")
     raise BrowserAutomationError(
         f"等待 Gmail 发送确认超时（{timeout_ms // 1000} 秒），请检查该窗口是否已发送"
     )
@@ -699,7 +1091,7 @@ def wait_for_gmail_alerts_clear(
             current = []
         if not baseline_set or not any(text in baseline_set for text in current):
             return
-        time.sleep(0.2)
+        time.sleep(0.1)
     raise BrowserAutomationError(
         "旧发送提示未在限定时间内消失，已取消自动发送以避免误判发送结果"
     )

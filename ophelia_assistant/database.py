@@ -10,6 +10,9 @@ from typing import Iterator
 from .config import app_data_dir
 
 
+DATABASE_SCHEMA_VERSION = 3
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +65,7 @@ class Database:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            conn.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
             if "gender_label" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN gender_label TEXT DEFAULT 'unspecified'")
@@ -130,6 +134,9 @@ class Database:
                 ("sent_method", "TEXT DEFAULT ''"),
                 ("needs_manual_review", "INTEGER DEFAULT 0"),
                 ("render_context_hash", "TEXT DEFAULT ''"),
+                ("stage_timings_json", "TEXT DEFAULT '{}'"),
+                ("verify_result_json", "TEXT DEFAULT '{}'"),
+                ("failure_screenshot", "TEXT DEFAULT ''"),
             ):
                 if column not in final_columns:
                     conn.execute(
@@ -163,6 +170,10 @@ class Database:
                 "UPDATE tasks SET sent_method='manual' "
                 "WHERE status='sent' AND (sent_method IS NULL OR sent_method='')"
             )
+
+    def schema_version(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -643,7 +654,8 @@ class Database:
             "failed_at", "last_failed_at", "failure_stage", "browser_type",
             "window_assignment_type", "resolved_sender_name",
             "sender_name_source", "sent_method", "needs_manual_review",
-            "render_context_hash", "last_error", "attempts",
+            "render_context_hash", "stage_timings_json", "verify_result_json",
+            "failure_screenshot", "last_error", "attempts",
         }
         unknown = sorted(set(values) - allowed)
         if unknown:
@@ -665,6 +677,60 @@ class Database:
                 ):
                     raise ValueError("该任务的窗口编号已锁定，只有删除任务才能解除")
             conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*values.values(), task_id))
+
+    def update_tasks_batch(self, updates: dict[int, dict]) -> int:
+        """Apply per-task updates inside one transaction."""
+        if not updates:
+            return 0
+        allowed = {
+            "profile_no", "profile_locked", "first_name", "last_name", "location", "location_source",
+            "name_override", "location_override", "sender_name_override",
+            "subject", "body", "gender_label", "gender_source", "source_urls",
+            "review_reason", "status", "custom_variables",
+            "campaign_id", "generated_at", "assigned_at", "fill_started_at",
+            "validation_at", "drafted_at", "send_attempt_started_at",
+            "send_clicked_at", "sent_at", "replied_at",
+            "failed_at", "last_failed_at", "failure_stage", "browser_type",
+            "window_assignment_type", "resolved_sender_name",
+            "sender_name_source", "sent_method", "needs_manual_review",
+            "render_context_hash", "stage_timings_json", "verify_result_json",
+            "failure_screenshot", "last_error", "attempts",
+        }
+        rows: list[tuple[int, dict]] = []
+        for task_id, values in updates.items():
+            unknown = sorted(set(values) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"不允许更新任务字段：{', '.join(unknown)}"
+                )
+            if values:
+                rows.append((int(task_id), dict(values)))
+        if not rows:
+            return 0
+        with self.connect() as conn:
+            changed = 0
+            for task_id, values in rows:
+                current = conn.execute(
+                    "SELECT profile_no, profile_locked FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+                if current is None:
+                    continue
+                if "profile_no" in values:
+                    if (
+                        int(current["profile_locked"] or 0) == 1
+                        and int(values["profile_no"] or 0)
+                        != int(current["profile_no"] or 0)
+                    ):
+                        raise ValueError(
+                            "该任务的窗口编号已锁定，只有删除任务才能解除"
+                        )
+                sets = ", ".join(f"{key}=?" for key in values)
+                changed += conn.execute(
+                    f"UPDATE tasks SET {sets} WHERE id=?",
+                    (*values.values(), task_id),
+                ).rowcount
+            return int(changed)
 
     def lock_task_profile(self, task_id: int, profile_no: int) -> int:
         """Set and permanently lock a task's browser profile until deletion."""

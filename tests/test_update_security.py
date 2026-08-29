@@ -79,13 +79,16 @@ class SettingsEncryptionGuardTests(unittest.TestCase):
                 return_value=Path(temp),
             ), mock.patch(
                 "ophelia_assistant.config._protect_secret",
-                side_effect=lambda value: value,
+                side_effect=RuntimeError(
+                    "无法加密 API Key，已取消保存"
+                ),
             ), mock.patch(
                 "ophelia_assistant.config.sys.platform",
                 "win32",
             ):
                 settings = Settings()
                 settings.adspower_api_key = "secret-api-key"
+                settings.mark_api_key_dirty()
                 with self.assertRaisesRegex(RuntimeError, "加密"):
                     settings.save()
 

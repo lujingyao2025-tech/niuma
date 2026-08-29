@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -8,6 +9,9 @@ from pathlib import Path
 from typing import Protocol
 
 import requests
+
+
+logger = logging.getLogger("niuma-mail")
 
 
 BROWSER_PROVIDER_NAMES = {
@@ -929,20 +933,52 @@ class BitBrowserClient:
             profiles = self._profiles or self._load_profiles(1)
         except BrowserProviderError:
             profiles = []
+        total = len(profiles)
+        with_status = 0
+        running_count = 0
+        with_cdp = 0
         for profile in profiles:
             number = profile.get("seq")
             if number is None:
                 continue
-            status = profile.get("status") or profile.get("online")
+            status = profile.get("status")
             if status is None:
-                continue
+                status = profile.get("online")
+            if status is not None:
+                with_status += 1
             cdp = _cdp_value(profile)
-            if not cdp or (verify_connection and not _cdp_reachable(cdp)):
-                continue
+            if cdp:
+                with_cdp += 1
             if status in running_values:
+                running_count += 1
+                if verify_connection and cdp and not _cdp_reachable(cdp):
+                    logger.info(
+                        "BitBrowser 窗口 %s CDP %s 连接失败，已排除",
+                        number,
+                        cdp,
+                    )
+                    continue
                 windows.append((str(number), str(profile.get("name") or "")))
+        logger.info(
+            "BitBrowser /browser/list 诊断: 共 %d 个窗口，含运行状态 %d 个，"
+            "运行中 %d 个，含调试端口 %d 个，入选 %d 个",
+            total,
+            with_status,
+            running_count,
+            with_cdp,
+            len(windows),
+        )
         if not windows:
-            self.last_error = "BitBrowser 未返回已打开窗口状态，请确认窗口已启动"
+            if total and not running_count:
+                self.last_error = (
+                    f"读取到 {total} 个窗口，但运行中（status=1）为 0 个；"
+                    "请先打开浏览器窗口后重试"
+                )
+            else:
+                self.last_error = (
+                    f"读取到运行中窗口 {running_count} 个，但均无法验证连接；"
+                    "请检查 BitBrowser 调试端口后重试"
+                )
         return windows
 
 

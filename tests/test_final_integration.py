@@ -11,6 +11,12 @@ try:
 except ImportError:
     raise unittest.SkipTest("playwright/requests not installed")
 
+try:
+    import PySide6  # noqa: F401
+    PYSIDE_AVAILABLE = True
+except ImportError:
+    PYSIDE_AVAILABLE = False
+
 from ophelia_assistant.batch import assign_windows, group_tasks_by_window
 from ophelia_assistant.config import MAX_CONTACT_ROWS, Settings
 from ophelia_assistant.database import Database
@@ -114,6 +120,29 @@ class WindowAssignmentTests(unittest.TestCase):
         self.assertEqual(result[0]["profile_no"], 30)
         self.assertIsNone(result[2]["profile_no"])
 
+    def test_saved_window_order_is_preserved(self) -> None:
+        tasks = [
+            {"id": 1, "profile_no": 0, "profile_locked": 0},
+            {"id": 2, "profile_no": 0, "profile_locked": 0},
+            {"id": 3, "profile_no": 0, "profile_locked": 0},
+        ]
+        result = assign_windows(tasks, [197, 199, 196, 198])
+        self.assertEqual(
+            [item["profile_no"] for item in result],
+            [197, 199, 196],
+        )
+
+    def test_thirty_windows_all_assigned(self) -> None:
+        tasks = [
+            {"id": index, "profile_no": 0, "profile_locked": 0}
+            for index in range(1, 31)
+        ]
+        result = assign_windows(tasks, list(range(30, 0, -1)))
+        assigned = [item["profile_no"] for item in result]
+        self.assertEqual(len(assigned), 30)
+        self.assertEqual(len(set(assigned)), 30)
+        self.assertEqual(assigned, list(range(30, 0, -1)))
+
 
 class SenderPriorityTests(unittest.TestCase):
     def _workflow(self, **settings_overrides):
@@ -137,7 +166,10 @@ class SenderPriorityTests(unittest.TestCase):
             "sender_name_override": sender,
             "resolved_sender_name": resolved,
         }
-        workflow = self._workflow(window_bindings=binding)
+        workflow = self._workflow(
+            window_bindings=binding,
+            window_sequence=[profile] if profile > 0 else [],
+        )
         workflow.settings.saved_templates = [
             {
                 "name": "T",
@@ -323,6 +355,18 @@ class RunningWindowTests(unittest.TestCase):
             )
         self.assertEqual([number for number, _ in windows], ["196"])
 
+    def test_bitbrowser_status_one_without_cdp_is_recognized(self) -> None:
+        from ophelia_assistant.morelogin import BitBrowserClient
+
+        client = BitBrowserClient("http://127.0.0.1")
+        client._profiles = [
+            {"seq": 196, "name": "A", "status": 1},
+            {"seq": 197, "name": "B", "status": 0},
+            {"seq": 198, "name": "C", "status": 2},
+        ]
+        windows = client.list_running_windows(verify_connection=True)
+        self.assertEqual([number for number, _ in windows], ["196"])
+
 
 class ConfirmActionsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -368,9 +412,11 @@ class ConfirmActionsTests(unittest.TestCase):
             window.confirm_tasks_sent()
         app.processEvents()
         self.assertEqual(self.db.get_task(task_id)["status"], "generated")
+        window._closing = True
         window.close()
 
 
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 not installed")
 class AsyncCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -425,6 +471,7 @@ class AsyncCompatibilityTests(unittest.TestCase):
             app.processEvents()
             time.sleep(0.05)
         self.assertEqual(results, ["ok"])
+        window._closing = True
         window.close()
 
     def test_auto_fill_windows_uses_running_windows(self) -> None:
@@ -449,6 +496,7 @@ class AsyncCompatibilityTests(unittest.TestCase):
                 time.sleep(0.05)
         self.assertEqual(window.settings.window_sequence, [196])
         self.assertEqual(calls, [True])
+        window._closing = True
         window.close()
 
     def test_check_update_async_signature(self) -> None:
@@ -471,6 +519,7 @@ class AsyncCompatibilityTests(unittest.TestCase):
                 app.processEvents()
                 time.sleep(0.05)
         self.assertFalse(window._busy)
+        window._closing = True
         window.close()
 
 
@@ -531,6 +580,7 @@ class CrashRecoveryTests(unittest.TestCase):
                 "locked": True,
             }
         }
+        settings.window_sequence = [7]
         workflow = Workflow(db=self.db, settings=settings)
         task_id = self.db.add_local_task("Alex", "Seattle", "alex@example.com")
         workflow.generate_local(task_id)
@@ -683,6 +733,139 @@ class RenderContextHashTests(unittest.TestCase):
         settings.active_template_name = "T2"
         hash_two = workflow._render_context_hash(task)
         self.assertNotEqual(hash_one, hash_two)
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 not installed")
+class CloseFlowTests(AsyncCompatibilityTests):
+    class _Event:
+        def __init__(self):
+            self.ignored = False
+            self.accepted = False
+
+        def ignore(self):
+            self.ignored = True
+
+        def accept(self):
+            self.accepted = True
+
+    def test_cancel_choice_keeps_everything(self) -> None:
+        window, app = self._window()
+        event = self._Event()
+        with mock.patch.object(
+            window, "_close_choice", return_value="cancel"
+        ):
+            window.closeEvent(event)
+        app.processEvents()
+        self.assertTrue(event.ignored)
+        self.assertFalse(window._closing)
+        window._closing = True
+        window.close()
+
+    def test_background_choice_minimizes(self) -> None:
+        window, app = self._window()
+        event = self._Event()
+        with mock.patch.object(
+            window, "_close_choice", return_value="background"
+        ), mock.patch.object(window, "showMinimized") as minimized:
+            window.closeEvent(event)
+        app.processEvents()
+        minimized.assert_called_once()
+        self.assertTrue(event.ignored)
+        window._closing = True
+        window.close()
+
+    def test_exit_choice_finishes_close_after_cancel(self) -> None:
+        window, app = self._window()
+        event = self._Event()
+        with mock.patch.object(
+            window, "_close_choice", return_value="exit"
+        ), mock.patch.object(window, "_finish_close") as finish:
+            window.closeEvent(event)
+        app.processEvents()
+        finish.assert_called_once()
+        self.assertTrue(window._closing)
+        window._closing = True
+        window.close()
+
+
+@unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 not installed")
+class WindowBindingPanelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        self._temp = tempfile.TemporaryDirectory()
+        os.environ["NIUMA_MAIL_TRIAL_DIR"] = self._temp.name
+        os.environ["NIUMA_MAIL_DISABLE_REGISTRY"] = "1"
+        self._patch_db = mock.patch(
+            "ophelia_assistant.database.app_data_dir",
+            return_value=Path(self._temp.name),
+        )
+        self._patch_cfg = mock.patch(
+            "ophelia_assistant.config.app_data_dir",
+            return_value=Path(self._temp.name),
+        )
+        self._patch_db.start()
+        self._patch_cfg.start()
+
+    def tearDown(self) -> None:
+        self._patch_cfg.stop()
+        self._patch_db.stop()
+        os.environ.pop("NIUMA_MAIL_TRIAL_DIR", None)
+        os.environ.pop("NIUMA_MAIL_DISABLE_REGISTRY", None)
+        self._temp.cleanup()
+
+    def test_bindings_generated_for_saved_sequence_and_persist(self) -> None:
+        from PySide6.QtWidgets import QApplication, QCheckBox, QLineEdit
+
+        from ophelia_assistant.config import Settings
+        from ophelia_assistant.studio.main_window import MainWindow
+
+        settings = Settings()
+        settings.window_sequence = [199, 198, 197, 196]
+        settings.window_bindings = {}
+        settings.save()
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        window.show()
+        app.processEvents()
+        panel = window.pages[0].window_panel
+        self.assertEqual(panel.bindings_table.columnCount(), 4)
+        self.assertEqual(panel.bindings_table.rowCount(), 4)
+        sender = panel.bindings_table.cellWidget(0, 2)
+        lock = panel.bindings_table.cellWidget(0, 3)
+        self.assertIsInstance(sender, QLineEdit)
+        self.assertIsInstance(lock, QCheckBox)
+        sender.setText("Anna Lee")
+        lock.setChecked(True)
+        panel.save_bindings()
+        reloaded = Settings.load()
+        self.assertEqual(
+            reloaded.window_bindings["199"]["sender_name"],
+            "Anna Lee",
+        )
+        self.assertTrue(reloaded.window_bindings["199"]["locked"])
+        self.assertEqual(len(reloaded.window_bindings), 4)
+        window._closing = True
+        window.close()
+
+    def test_bindings_generated_for_twenty_windows(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        from ophelia_assistant.config import Settings
+        from ophelia_assistant.studio.main_window import MainWindow
+
+        settings = Settings()
+        settings.window_sequence = list(range(180, 200))
+        settings.window_bindings = {}
+        settings.save()
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        window.show()
+        app.processEvents()
+        panel = window.pages[0].window_panel
+        self.assertEqual(panel.bindings_table.rowCount(), 20)
+        self.assertEqual(panel.bindings_table.columnCount(), 4)
+        window._closing = True
+        window.close()
 
 
 if __name__ == "__main__":

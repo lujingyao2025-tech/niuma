@@ -1695,7 +1695,12 @@ class App(tk.Tk):
     def auto_fill_window_sequence(self) -> None:
         provider = create_browser_provider(self.settings)
         try:
-            windows = provider.list_windows()
+            list_open = getattr(provider, "list_running_windows", None)
+            windows = (
+                list_open(verify_connection=True)
+                if list_open is not None
+                else provider.list_windows()
+            )
         except Exception as exc:
             self._set_status(f"获取窗口失败：{exc}")
             messagebox.showerror("获取窗口失败", str(exc))
@@ -1706,7 +1711,21 @@ class App(tk.Tk):
                 tr("未识别到浏览器窗口，请确认浏览器应用已启动"),
             )
             return
-        numbers = [number for number, _name in windows][:MAX_WINDOW_SEQUENCE]
+        discovered: list[int] = []
+        for number, _name in windows:
+            try:
+                parsed = int(number)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0 and parsed not in discovered:
+                discovered.append(parsed)
+        merged: list[int] = []
+        for number in self.settings.window_sequence:
+            if number in discovered and number not in merged:
+                merged.append(number)
+        for number in sorted(discovered, reverse=True):
+            if number not in merged and len(merged) < MAX_WINDOW_SEQUENCE:
+                merged.append(number)
         labels = [
             f"{number} · {name}" if name else number
             for number, name in windows
@@ -1714,14 +1733,14 @@ class App(tk.Tk):
         if hasattr(self, "window_picker_combo"):
             self.window_picker_combo["values"] = labels
         self.window_sequence_vars = [
-            tk.StringVar(value=str(number)) for number in numbers
+            tk.StringVar(value=str(number)) for number in merged
         ]
         self._render_window_sequence_rows()
         self.window_sequence_note_var.set(
-            trf("已设置 {count} 个窗口", count=len(numbers))
+            trf("已设置 {count} 个窗口", count=len(merged))
         )
         self._set_status(
-            f"已自动获取 {len(numbers)} 个窗口编号，请点击“保存窗口顺序”生效"
+            f"已自动获取 {len(merged)} 个窗口编号，请点击“保存窗口顺序”生效"
         )
 
     def delete_window_sequence_row(self, row_index: int) -> None:
@@ -3221,8 +3240,7 @@ class App(tk.Tk):
             messagebox.showerror("窗口顺序无效", str(exc))
             return
         old_bindings = dict(self.settings.window_bindings or {})
-        self.settings.window_sequence = sequence
-        bindings: dict[str, dict] = {}
+        bindings: dict[str, dict] = dict(old_bindings)
         template_vars = getattr(self, "_window_template_vars", [])
         sender_vars = getattr(self, "_window_sender_vars", [])
         for index, number in enumerate(sequence):
@@ -3237,13 +3255,22 @@ class App(tk.Tk):
             bindings[str(number)] = {
                 "template_name": template_name,
                 "sender_name": sender,
+                "locked": bool(
+                    (old_bindings.get(str(number)) or {}).get("locked")
+                ),
             }
-        self.settings.window_bindings = bindings
-        self.settings.save()
+        try:
+            self.settings.save_window_sequence(sequence)
+            self.settings.save_window_bindings(bindings)
+        except Exception as exc:
+            self._set_status(f"窗口顺序保存失败：{exc}")
+            messagebox.showerror("窗口顺序保存失败", str(exc))
+            return
         self.window_sequence_vars = [tk.StringVar(value=str(value)) for value in sequence]
         self._render_window_sequence_rows()
         self.window_sequence_note_var.set(f"已设置 {len(sequence)} 个窗口")
-        self._set_status(f"已保存 {len(sequence)} 个浏览器窗口编号")
+        detail = "、".join(str(number) for number in sequence)
+        self._set_status(f"窗口顺序已保存：{detail}")
         changed = [
             number
             for number in sequence
@@ -3265,8 +3292,12 @@ class App(tk.Tk):
             return
         self.window_sequence_vars.clear()
         self._render_window_sequence_rows()
-        self.settings.window_sequence = []
-        self.settings.save()
+        try:
+            self.settings.save_window_sequence([])
+        except Exception as exc:
+            self._set_status(f"清空窗口顺序失败：{exc}")
+            messagebox.showerror("清空窗口顺序失败", str(exc))
+            return
         self.window_sequence_note_var.set("已设置 0 个窗口")
         self._set_status("窗口顺序已清空；已经锁定到任务的编号不会改变")
 
@@ -3342,8 +3373,12 @@ class App(tk.Tk):
             row = self.db.get_task(task_id)
             if row is not None and int(row["profile_locked"] or 0) != 1:
                 self.db.lock_task_profile(task_id, profile_no)
-        self.settings.window_sequence = sequence
-        self.settings.save()
+        try:
+            self.settings.save_window_sequence(sequence)
+        except Exception as exc:
+            self._set_status(f"窗口顺序保存失败：{exc}")
+            messagebox.showerror("窗口顺序保存失败", str(exc))
+            return
         self.window_sequence_vars = [tk.StringVar(value=str(value)) for value in sequence]
         self._render_window_sequence_rows()
         self.window_sequence_note_var.set(f"已设置 {len(sequence)} 个窗口")
@@ -4592,12 +4627,24 @@ class App(tk.Tk):
     def _apply_authorization_state(self) -> None:
         remaining = remaining_text(self._trial_status)
         remaining = tr(remaining)
+        mode_text = (
+            tr("本地模式")
+            if self._trial_status.active
+            else tr("功能已锁定")
+        )
+        if getattr(self._trial_status, "suspicious", False):
+            mode_text = tr("授权异常，请核对")
         self.connection_var.set(
             f"{remaining} · "
-            f"{tr('本地模式') if self._trial_status.active else tr('功能已锁定')}"
+            f"{mode_text}"
         )
         if hasattr(self, "trial_remaining_var"):
-            self.trial_remaining_var.set(remaining)
+            trial_text = remaining
+            if getattr(self._trial_status, "suspicious", False):
+                trial_text += "\n" + tr(
+                    "检测到授权状态异常，请核对（已暂停自动写回）"
+                )
+            self.trial_remaining_var.set(trial_text)
         if hasattr(self, "profile_assign_button"):
             if self._trial_status.active:
                 self.profile_assign_button.state(["!disabled"])
@@ -4692,7 +4739,10 @@ class App(tk.Tk):
         )
         self.settings.morelogin_url = self.morelogin_var.get().strip()
         self.settings.adspower_url = self.adspower_var.get().strip()
-        self.settings.adspower_api_key = self.adspower_api_key_var.get().strip()
+        new_api_key = self.adspower_api_key_var.get().strip()
+        if new_api_key != self.settings.adspower_api_key:
+            self.settings.mark_api_key_dirty()
+        self.settings.adspower_api_key = new_api_key
         self.settings.bitbrowser_url = self.bitbrowser_var.get().strip()
         self.settings.sender_name = self.sender_var.get().strip()
         if hasattr(self, "language_var"):

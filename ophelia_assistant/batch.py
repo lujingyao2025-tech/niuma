@@ -37,7 +37,11 @@ def assign_windows(
     become permanent manual windows.
     """
     rows = [dict(row) for row in tasks]
-    available = sorted({int(w) for w in open_windows if int(w) > 0}, reverse=True)
+    available: list[int] = []
+    for raw_window in open_windows:
+        window = int(raw_window)
+        if window > 0 and window not in available:
+            available.append(window)
     assignments: dict[int, dict] = {}
     used: dict[int, int] = {}
 
