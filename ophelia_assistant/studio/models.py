@@ -19,14 +19,17 @@ from ..i18n import tr
 STATUS_TEXT = {
     "pending": "待处理",
     "generated": "已生成",
+    "waiting_window": "等待可用窗口",
+    "assigned": "已分配窗口",
     "filling": "正在填写",
+    "validating": "正在校验",
     "drafted": "Gmail 草稿",
     "sending": "正在发送",
     "sent": "已发送",
     "replied": "已回复",
     "failed": "发送失败",
+    "needs_review": "需要人工确认",
     "cancelled": "已取消",
-    "needs_review": "需要手动修改",
 }
 
 
@@ -165,12 +168,15 @@ class TaskTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if key == "status":
                 status = str(row.get("status") or "")
-                if status in {"ready", "needs_review", "drafted"}:
+                if status in {
+                    "generated", "waiting_window", "assigned", "filling",
+                    "validating", "drafted", "sending", "needs_review",
+                }:
                     from PySide6.QtGui import QColor
 
                     colors = {
                         "ready": "#C7740A",
-                        "needs_review": "#DC2626",
+                        "needs_review": "#C7740A",
                         "drafted": "#0284C7",
                     }
                     return QColor(colors[status])

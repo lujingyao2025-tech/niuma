@@ -115,11 +115,21 @@ class Database:
                 row[1] for row in conn.execute("PRAGMA table_info(tasks)")
             }
             for column, definition in (
+                ("assigned_at", "TEXT"),
                 ("fill_started_at", "TEXT"),
+                ("validation_at", "TEXT"),
+                ("send_attempt_started_at", "TEXT"),
                 ("send_clicked_at", "TEXT"),
+                ("failed_at", "TEXT"),
                 ("last_failed_at", "TEXT"),
                 ("failure_stage", "TEXT DEFAULT ''"),
                 ("browser_type", "TEXT DEFAULT ''"),
+                ("window_assignment_type", "TEXT DEFAULT ''"),
+                ("resolved_sender_name", "TEXT DEFAULT ''"),
+                ("sender_name_source", "TEXT DEFAULT ''"),
+                ("sent_method", "TEXT DEFAULT ''"),
+                ("needs_manual_review", "INTEGER DEFAULT 0"),
+                ("render_context_hash", "TEXT DEFAULT ''"),
             ):
                 if column not in final_columns:
                     conn.execute(
@@ -133,6 +143,26 @@ class Database:
             )
             conn.execute("UPDATE tasks SET status='pending' WHERE status='new'")
             conn.execute("UPDATE tasks SET status='generated' WHERE status='ready'")
+            conn.execute(
+                "UPDATE tasks SET status='needs_review', needs_manual_review=1 "
+                "WHERE status='sending' AND send_clicked_at IS NOT NULL "
+                "AND send_clicked_at <> ''"
+            )
+            conn.execute(
+                "UPDATE tasks SET status=CASE "
+                "WHEN drafted_at IS NULL THEN 'generated' ELSE 'drafted' END "
+                "WHERE status IN ('assigned', 'filling', 'validating') "
+                "OR (status='sending' AND (send_clicked_at IS NULL OR send_clicked_at=''))"
+            )
+            conn.execute(
+                "UPDATE tasks SET sent_method='confirmed' "
+                "WHERE status='sent' AND send_clicked_at IS NOT NULL "
+                "AND (sent_method IS NULL OR sent_method='')"
+            )
+            conn.execute(
+                "UPDATE tasks SET sent_method='manual' "
+                "WHERE status='sent' AND (sent_method IS NULL OR sent_method='')"
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -241,22 +271,30 @@ class Database:
                 """SELECT COUNT(*) AS total,
                     SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
                     SUM(CASE WHEN status = 'generated' THEN 1 ELSE 0 END) AS generated,
-                    SUM(CASE WHEN status IN ('filling', 'drafted', 'sending')
+                    SUM(CASE WHEN status = 'waiting_window' THEN 1 ELSE 0 END) AS waiting,
+                    SUM(CASE WHEN status IN ('assigned', 'filling', 'validating',
+                        'drafted', 'sending')
                         THEN 1 ELSE 0 END) AS processing,
-                    SUM(CASE WHEN status IN ('sent', 'replied')
+                    SUM(CASE WHEN status = 'sent' AND sent_method = 'confirmed'
                         THEN 1 ELSE 0 END) AS sent,
+                    SUM(CASE WHEN (status = 'sent' AND sent_method = 'manual')
+                        OR status = 'replied'
+                        THEN 1 ELSE 0 END) AS sent_manual,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status IN ('cancelled', 'needs_review')
-                        THEN 1 ELSE 0 END) AS other
+                    SUM(CASE WHEN status = 'needs_review' THEN 1 ELSE 0 END) AS review,
+                    SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS other
                 FROM tasks"""
             ).fetchone()
         return {
             "total": int(row["total"] or 0),
             "pending": int(row["pending"] or 0),
             "generated": int(row["generated"] or 0),
+            "waiting": int(row["waiting"] or 0),
             "processing": int(row["processing"] or 0),
             "sent": int(row["sent"] or 0),
+            "sent_manual": int(row["sent_manual"] or 0),
             "failed": int(row["failed"] or 0),
+            "review": int(row["review"] or 0),
             "other": int(row["other"] or 0),
         }
 
@@ -579,7 +617,7 @@ class Database:
         with self.connect() as conn:
             return conn.execute(
                 "SELECT * FROM tasks WHERE profile_no IN (" + placeholders + ") "
-                "AND status IN ('pending', 'generated') ORDER BY id",
+                "AND status IN ('pending', 'generated', 'assigned') ORDER BY id",
                 numbers,
             ).fetchall()
 
@@ -599,10 +637,13 @@ class Database:
             "name_override", "location_override", "sender_name_override",
             "subject", "body", "gender_label", "gender_source", "source_urls",
             "review_reason", "status", "custom_variables",
-            "campaign_id", "generated_at", "fill_started_at", "drafted_at",
+            "campaign_id", "generated_at", "assigned_at", "fill_started_at",
+            "validation_at", "drafted_at", "send_attempt_started_at",
             "send_clicked_at", "sent_at", "replied_at",
-            "last_failed_at", "failure_stage", "browser_type",
-            "last_error", "attempts",
+            "failed_at", "last_failed_at", "failure_stage", "browser_type",
+            "window_assignment_type", "resolved_sender_name",
+            "sender_name_source", "sent_method", "needs_manual_review",
+            "render_context_hash", "last_error", "attempts",
         }
         unknown = sorted(set(values) - allowed)
         if unknown:
@@ -669,13 +710,13 @@ class Database:
             if replied:
                 cur = conn.execute(
                     "UPDATE tasks SET status=?, replied_at=?, "
-                    "sent_at=COALESCE(sent_at, ?) "
+                    "sent_at=COALESCE(sent_at, ?), sent_method='manual' "
                     f"WHERE id IN ({placeholders})",
                     (status, stamp, stamp, *ids),
                 )
             else:
                 cur = conn.execute(
-                    f"UPDATE tasks SET status=?, sent_at=? "
+                    f"UPDATE tasks SET status=?, sent_at=?, sent_method='manual' "
                     f"WHERE id IN ({placeholders})",
                     (status, stamp, *ids),
                 )
@@ -692,6 +733,7 @@ class Database:
                 "UPDATE tasks SET status=CASE "
                 "WHEN drafted_at IS NULL THEN 'generated' ELSE 'drafted' END, "
                 "sent_at=NULL, replied_at=NULL, "
+                "sent_method='', "
                 f"last_error='' WHERE id IN ({placeholders}) "
                 "AND status IN ('sent', 'replied')",
                 ids,

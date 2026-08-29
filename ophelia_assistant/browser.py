@@ -644,8 +644,9 @@ def wait_for_gmail_send(
     browser: Browser,
     timeout_ms: int = 300_000,
     cancel_event: threading.Event | None = None,
+    baseline: tuple[str, ...] | None = None,
 ) -> None:
-    """Wait until Gmail shows a send success toast; fail on explicit errors."""
+    """Wait until Gmail shows a NEW send toast; old toasts must be cleared first."""
     page = _compose_page(browser) or _gmail_page(browser)
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -665,4 +666,40 @@ def wait_for_gmail_send(
         time.sleep(1)
     raise BrowserAutomationError(
         f"等待 Gmail 发送确认超时（{timeout_ms // 1000} 秒），请检查该窗口是否已发送"
+    )
+
+
+def gmail_alert_baseline(browser: Browser) -> tuple[str, ...]:
+    """Capture current role=alert texts before clicking Send."""
+    page = _compose_page(browser) or _gmail_page(browser)
+    try:
+        return tuple(page.locator('[role="alert"]').all_inner_texts())
+    except PlaywrightError:
+        return ()
+
+
+def wait_for_gmail_alerts_clear(
+    browser: Browser,
+    baseline: tuple[str, ...] | None = None,
+    timeout_ms: int = 8000,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Wait until pre-click toasts are gone so a same-text new toast is trusted."""
+    page = _compose_page(browser) or _gmail_page(browser)
+    baseline_set = {str(text) for text in (baseline or ())}
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        check_cancel(cancel_event)
+        try:
+            current = [
+                str(alert)
+                for alert in page.locator('[role="alert"]').all_inner_texts()
+            ]
+        except PlaywrightError:
+            current = []
+        if not baseline_set or not any(text in baseline_set for text in current):
+            return
+        time.sleep(0.2)
+    raise BrowserAutomationError(
+        "旧发送提示未在限定时间内消失，已取消自动发送以避免误判发送结果"
     )

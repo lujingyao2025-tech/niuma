@@ -3,6 +3,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+try:
+    import playwright  # noqa: F401
+    import requests  # noqa: F401
+except ImportError:
+    raise unittest.SkipTest("playwright/requests not installed")
+
 from ophelia_assistant.batch import group_tasks_by_window
 from ophelia_assistant.browser import (
     FAILURE_PROMPT_RE,
@@ -145,7 +151,7 @@ class StatsAndMigrationTests(unittest.TestCase):
         failed = self.db.add_local_task("D", "Seattle", "d@example.com", campaign_id=campaign_id)
         self.db.update_task(pending, status="pending")
         self.db.update_task(generated, status="generated")
-        self.db.update_task(sent, status="sent")
+        self.db.update_task(sent, status="sent", sent_method="confirmed")
         self.db.update_task(failed, status="failed")
         stats = self.db.stats()
         self.assertEqual(stats["total"], 4)
@@ -154,8 +160,9 @@ class StatsAndMigrationTests(unittest.TestCase):
         self.assertEqual(stats["sent"], 1)
         self.assertEqual(stats["failed"], 1)
         self.assertEqual(
-            stats["pending"] + stats["generated"] + stats["processing"]
-            + stats["sent"] + stats["failed"] + stats["other"],
+            stats["pending"] + stats["generated"] + stats["waiting"]
+            + stats["processing"] + stats["sent"] + stats["sent_manual"]
+            + stats["failed"] + stats["review"] + stats["other"],
             stats["total"],
         )
 

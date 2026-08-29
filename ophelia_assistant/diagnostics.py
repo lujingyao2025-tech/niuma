@@ -109,6 +109,7 @@ def write_error_report(
     screenshot_path: str = "",
     settings=None,
     extra_trail: list | None = None,
+    context: dict | None = None,
 ) -> Path:
     """Write a self-contained error report the user can send back verbatim."""
     from . import __version__
@@ -127,6 +128,11 @@ def write_error_report(
     ]
     if screenshot_path:
         lines.append(f"失败截图: {screenshot_path}")
+    if context:
+        lines.append("")
+        lines.append("任务上下文:")
+        for key, value in context.items():
+            lines.append(f"{key}: {value}")
     lines.append("")
     lines.append("异常类型:")
     lines.append(type(exc).__name__)
@@ -157,4 +163,3 @@ def write_error_report(
     except OSError:
         return path
     return path
-

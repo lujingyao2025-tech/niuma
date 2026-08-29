@@ -6,6 +6,7 @@ from PySide6.QtCore import QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -51,14 +52,17 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         mapping = {
             "pending": (self.p.muted, self.p.hover),
             "generated": (self.p.info, self.p.info_soft),
+            "waiting_window": (self.p.faint, self.p.hover),
+            "assigned": (self.p.accent, self.p.accent_soft),
             "filling": (self.p.accent, self.p.accent_soft),
+            "validating": (self.p.accent, self.p.accent_soft),
             "drafted": (self.p.info, self.p.info_soft),
             "sending": (self.p.accent, self.p.accent_soft),
             "sent": (self.p.ok, self.p.ok_soft),
             "replied": (self.p.ok, self.p.ok_soft),
             "failed": (self.p.danger, self.p.danger_soft),
+            "needs_review": (self.p.warn, self.p.warn_soft),
             "cancelled": (self.p.faint, self.p.hover),
-            "needs_review": (self.p.danger, self.p.danger_soft),
         }
         text_color, soft_color = mapping.get(status, (self.p.muted, self.p.hover))
         label = status_text(status)
@@ -196,14 +200,17 @@ class StatsBar(QWidget):
     def set_stats(self, stats: dict[str, int]) -> None:
         self.label.setText(
             tr("总 {total} · 待处理 {pending} · 已生成 {generated} "
-               "· 处理中 {processing} · 成功 {sent} · 失败 {failed}")
+               "· 等待窗口 {waiting} · 处理中 {processing} "
+               "· 成功 {sent} · 失败 {failed} · 需确认 {review}")
             .format(
                 total=stats.get("total", 0),
                 pending=stats.get("pending", 0),
                 generated=stats.get("generated", 0),
+                waiting=stats.get("waiting", 0),
                 processing=stats.get("processing", 0),
                 sent=stats.get("sent", 0),
                 failed=stats.get("failed", 0),
+                review=stats.get("review", 0),
             )
         )
 
@@ -580,7 +587,9 @@ class WindowPanel(QWidget):
 
         layout.addWidget(self._section_title(tr("窗口绑定（模板与发件人）")))
         self.bindings_table = QTableWidget(0, 3)
-        self.bindings_table.setHorizontalHeaderLabels([tr("窗口"), tr("模板"), tr("发件人")])
+        self.bindings_table.setHorizontalHeaderLabels(
+            [tr("窗口"), tr("模板"), tr("发件人"), tr("锁定")]
+        )
         self.bindings_table.verticalHeader().setVisible(False)
         self.bindings_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.bindings_table, 1)
@@ -619,8 +628,12 @@ class WindowPanel(QWidget):
                 template_cell.addItem(name, name)
             template_cell.setCurrentText(str(binding.get("template_name") or ""))
             sender_cell = QLineEdit(str(binding.get("sender_name") or ""))
+            lock_cell = QCheckBox()
+            lock_cell.setChecked(bool(binding.get("locked")))
+            lock_cell.setToolTip(tr("锁定后自动匹配不会覆盖此发件人姓名"))
             self.bindings_table.setCellWidget(row, 1, template_cell)
             self.bindings_table.setCellWidget(row, 2, sender_cell)
+            self.bindings_table.setCellWidget(row, 3, lock_cell)
 
     def add_row(self) -> None:
         row = self.sequence_table.rowCount()
@@ -662,13 +675,16 @@ class WindowPanel(QWidget):
                 continue
             template_cell = self.bindings_table.cellWidget(row, 1)
             sender_cell = self.bindings_table.cellWidget(row, 2)
+            lock_cell = self.bindings_table.cellWidget(row, 3)
             template_name = ""
             if isinstance(template_cell, QComboBox):
                 template_name = str(template_cell.currentData() or "")
             sender_name = sender_cell.text().strip() if isinstance(sender_cell, QLineEdit) else ""
+            locked = bool(lock_cell.isChecked()) if isinstance(lock_cell, QCheckBox) else False
             bindings[str(profile_item.text().strip())] = {
                 "template_name": template_name,
                 "sender_name": sender_name,
+                "locked": locked,
             }
         self.window.settings.window_bindings = bindings
         self.window.settings.save()
@@ -731,7 +747,7 @@ class TaskInspector(QWidget):
         copy_subject.clicked.connect(self.copy_subject)
         copy_body = QPushButton(tr("复制正文"))
         copy_body.clicked.connect(self.copy_body)
-        self.generate_button = QPushButton(tr("生成预览"))
+        self.generate_button = QPushButton(tr("生成邮件预览"))
         self.generate_button.setProperty("class", "primary")
         self.generate_button.clicked.connect(self.generate)
         self.auto_send_button = QPushButton(tr("填写并自动发送"))

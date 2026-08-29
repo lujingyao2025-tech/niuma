@@ -80,6 +80,9 @@ class SettingsEncryptionGuardTests(unittest.TestCase):
             ), mock.patch(
                 "ophelia_assistant.config._protect_secret",
                 side_effect=lambda value: value,
+            ), mock.patch(
+                "ophelia_assistant.config.sys.platform",
+                "win32",
             ):
                 settings = Settings()
                 settings.adspower_api_key = "secret-api-key"

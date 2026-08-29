@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -69,6 +70,78 @@ class SearchBox(QLineEdit):
         self.setFixedHeight(30)
         self.setMinimumWidth(180)
         self.returnPressed.connect(lambda: self.submitted.emit(self.text().strip()))
+
+
+class TaskProgressDialog(QDialog):
+    """Modal progress dialog with stop control, updated via queued signals."""
+
+    def __init__(self, parent, title: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("sectionTitle")
+        layout.addWidget(self.title_label)
+        self.detail_label = QLabel("")
+        self.detail_label.setObjectName("subtle")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        layout.addWidget(self.progress)
+        self.task_table = QTableWidget(0, 4)
+        self.task_table.setHorizontalHeaderLabels(
+            [tr("窗口"), tr("邮箱"), tr("阶段"), tr("结果")]
+        )
+        self.task_table.verticalHeader().setVisible(False)
+        self.task_table.horizontalHeader().setStretchLastSection(True)
+        self.task_table.setMaximumHeight(180)
+        layout.addWidget(self.task_table)
+        self._task_rows: dict[str, int] = {}
+        self.stop_button = QPushButton(tr("停止"))
+        self.stop_button.setProperty("class", "danger")
+        self.stop_button.clicked.connect(self._stop)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        layout.addLayout(buttons)
+
+    def _stop(self) -> None:
+        self.stop_button.setEnabled(False)
+        self.detail_label.setText(tr("正在停止，请稍候…"))
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "cancel_operation"):
+            parent.cancel_operation()
+
+    def update_progress(self, value: int, text: str) -> None:
+        if value >= 0:
+            self.progress.setValue(max(0, min(100, value)))
+        if text:
+            self.detail_label.setText(text)
+
+    def update_task(self, profile: str, email: str, stage: str, result: str = "") -> None:
+        key = f"{profile}|{email}"
+        row = self._task_rows.get(key)
+        if row is None:
+            row = self.task_table.rowCount()
+            self.task_table.insertRow(row)
+            self._task_rows[key] = row
+        values = [profile, email, stage, result]
+        for column, value in enumerate(values):
+            item = self.task_table.item(row, column)
+            if item is None:
+                item = QTableWidgetItem("")
+                self.task_table.setItem(row, column, item)
+            item.setText(value)
+
+    def finish(self, summary: str) -> None:
+        self.progress.setValue(100)
+        self.detail_label.setText(summary)
+        self.stop_button.setEnabled(False)
 
 
 class CommandPalette(QDialog):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import os
 import sys
 import tempfile
@@ -31,10 +32,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..batch import group_tasks_by_window
+from ..batch import assign_windows, group_tasks_by_window
 from ..config import (
     BATCH_DRAFT_INTERVAL_SECONDS,
     MAX_CONCURRENT_TASKS,
+    MAX_GENERATE_TASKS,
     MAX_WINDOW_SEQUENCE,
     Settings,
     app_data_dir,
@@ -63,6 +65,7 @@ from .widgets import (
     ContactPromptDialog,
     ImportContactsDialog,
     LicenseDialog,
+    TaskProgressDialog,
     TextPromptDialog,
 )
 from .workers import FunctionWorker, WorkerSignals
@@ -92,6 +95,7 @@ class MainWindow(QMainWindow):
         self._campaigns: list[dict] = []
         self._campaign_search_text = ""
         self._command_palette: CommandPalette | None = None
+        self._current_progress_dialog: TaskProgressDialog | None = None
         self._current_page = 0
 
         self.setWindowTitle(f"{tr('牛马邮箱')} · {tr('外贸邮件工作室')} v{__version__}")
@@ -586,9 +590,33 @@ class MainWindow(QMainWindow):
         cancel_event, serial = self.operations.begin()
         self.set_busy(True)
         signals = WorkerSignals()
+        signals.progress.connect(self._on_progress)
+        signals.task_status.connect(self._on_task_status)
 
         def runner(cancel_event, *run_args, **run_kwargs):
-            return fn(cancel_event, signals.progress.emit, *run_args, **run_kwargs)
+            try:
+                parameters = inspect.signature(fn).parameters
+                accepts_status = any(
+                    parameter.name == "task_status"
+                    or parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                    for parameter in parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_status = True
+            if accepts_status:
+                return fn(
+                    cancel_event,
+                    signals.progress.emit,
+                    signals.task_status.emit,
+                    *run_args,
+                    **run_kwargs,
+                )
+            return fn(
+                cancel_event,
+                signals.progress.emit,
+                *run_args,
+                **run_kwargs,
+            )
 
         def on_done_result(result):
             if self.operations.is_current(cancel_event, serial) and on_done is not None:
@@ -596,6 +624,7 @@ class MainWindow(QMainWindow):
 
         def on_error_message(exc):
             if self.operations.is_current(cancel_event, serial):
+                self._close_progress_dialog()
                 report_path = write_error_report(
                     exc,
                     title=tr("后台操作失败"),
@@ -616,6 +645,7 @@ class MainWindow(QMainWindow):
                 self.set_busy(False)
                 self.refresh_all()
                 self.set_status(tr("操作完成"))
+            self._close_progress_dialog()
 
         signals.done.connect(on_done_result)
         signals.error.connect(on_error_message)
@@ -628,6 +658,18 @@ class MainWindow(QMainWindow):
             **kwargs,
         )
         self.thread_pool.start(worker)
+
+    def _on_progress(self, value: int, text: str) -> None:
+        dialog = self._current_progress_dialog
+        if dialog is not None:
+            dialog.update_progress(value, text)
+
+    def _on_task_status(
+        self, profile: str, email: str, stage: str, result: str
+    ) -> None:
+        dialog = self._current_progress_dialog
+        if dialog is not None:
+            dialog.update_task(profile, email, stage, result)
 
     def cancel_operation(self) -> None:
         cancel_event, serial = self.operations.begin()
@@ -725,21 +767,47 @@ class MainWindow(QMainWindow):
         ids = [int(task_id) for task_id in task_ids]
         if not ids:
             return
-        ids = self._cap_task_ids(ids)
-        def run(cancel_event, progress, task_ids):
+        ids = list(dict.fromkeys(ids))[:MAX_GENERATE_TASKS]
+        def run(cancel_event, progress, task_status, task_ids):
+            def worker(ce, pr, task_id):
+                row = self.db.get_task(task_id)
+                email = row["recipient_email"] if row is not None else ""
+                task_status("", email, tr("生成中"), "")
+                return self.workflow.generate_local(task_id, cancel_event=ce)
+
             return self._run_tasks_parallel(
                 cancel_event,
                 progress,
                 task_ids,
-                lambda ce, pr, task_id: self.workflow.generate_local(
-                    task_id, cancel_event=ce
-                ),
+                worker,
+                task_status=task_status,
             )
 
-        def done(count):
+        def done(result):
+            count = (result or {}).get("completed", 0)
+            dialog = self._current_progress_dialog
+            if dialog is not None:
+                dialog.finish(
+                    tr("生成完成：成功 {success} · 失败 {failed}")
+                    .format(
+                        success=count - (result or {}).get("failed", 0),
+                        failed=(result or {}).get("failed", 0),
+                    )
+                )
             self.set_status(tr("已生成 {count} 封邮件预览").format(count=count))
 
+        dialog = TaskProgressDialog(self, tr("生成邮件预览"))
+        self._current_progress_dialog = dialog
+        dialog.show()
+
         self.run_async(run, on_done=done, task_ids=ids)
+
+    def _close_progress_dialog(self) -> None:
+        dialog = self._current_progress_dialog
+        self._current_progress_dialog = None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def _run_tasks_parallel(
         self,
@@ -747,21 +815,41 @@ class MainWindow(QMainWindow):
         progress,
         task_ids: list[int],
         worker,
-    ) -> int:
-        """Run task workers concurrently with a bounded pool and start stagger."""
+        stagger: bool = False,
+        task_status=None,
+    ) -> dict:
+        """Run task workers concurrently; returns structured batch results."""
         total = len(task_ids)
         if not total:
-            return 0
+            return {"completed": 0, "sent": 0, "failed": 0, "needs_review": 0}
         max_workers = min(MAX_CONCURRENT_TASKS, total)
-        errors: list[str] = []
-        completed = 0
+        result = {"completed": 0, "sent": 0, "failed": 0, "needs_review": 0}
+        lock = threading.Lock()
+
+        def emit_final(task_id, default_label):
+            if task_status is None:
+                return
+            row = self.db.get_task(task_id)
+            email = row["recipient_email"] if row is not None else ""
+            profile = row["profile_no"] if row is not None else ""
+            status = row["status"] if row is not None else ""
+            label = {
+                "sent": tr("发送成功"),
+                "failed": tr("发送失败"),
+                "needs_review": tr("需要确认"),
+                "cancelled": tr("已取消"),
+                "generated": tr("生成成功"),
+                "drafted": tr("草稿完成"),
+            }.get(status, default_label)
+            task_status(str(profile), email, tr("完成"), label)
+
         with ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="niuma-studio",
         ) as executor:
             futures = []
             for index, task_id in enumerate(task_ids):
-                delay = index * BATCH_DRAFT_INTERVAL_SECONDS
+                delay = index * BATCH_DRAFT_INTERVAL_SECONDS if stagger else 0
 
                 def one(ce, pr, task_id, delay):
                     if delay:
@@ -781,18 +869,49 @@ class MainWindow(QMainWindow):
                     for pending in futures:
                         pending.cancel()
                     raise
-                except Exception as exc:
-                    errors.append(str(exc))
-                completed += 1
+                except Exception:
+                    row = self.db.get_task(task_id)
+                    status = row["status"] if row is not None else ""
+                    with lock:
+                        if status == "needs_review":
+                            result["needs_review"] += 1
+                        else:
+                            result["failed"] += 1
+                        result["completed"] += 1
+                    progress(
+                        int(result["completed"] * 100 / total),
+                        tr("已完成 {completed}/{total} · 成功 {sent} · 失败 {failed}")
+                        .format(
+                            completed=result["completed"],
+                            total=total,
+                            sent=result["sent"],
+                            failed=result["failed"],
+                        ),
+                    )
+                    emit_final(task_id, tr("失败"))
+                    continue
+                row = self.db.get_task(task_id)
+                status = row["status"] if row is not None else ""
+                with lock:
+                    if status == "sent":
+                        result["sent"] += 1
+                    elif status == "needs_review":
+                        result["needs_review"] += 1
+                    elif status == "failed":
+                        result["failed"] += 1
+                    result["completed"] += 1
                 progress(
-                    completed,
-                    tr("已完成 {completed}/{total}").format(
-                        completed=completed, total=total
+                    int(result["completed"] * 100 / total),
+                    tr("已完成 {completed}/{total} · 成功 {sent} · 失败 {failed}")
+                    .format(
+                        completed=result["completed"],
+                        total=total,
+                        sent=result["sent"],
+                        failed=result["failed"],
                     ),
                 )
-        if errors:
-            raise RuntimeError(tr("部分任务失败：") + "；".join(errors[:5]))
-        return total
+                emit_final(task_id, tr("完成"))
+        return result
 
     def _run_window_parallel(
         self,
@@ -800,9 +919,10 @@ class MainWindow(QMainWindow):
         progress,
         task_ids: list[int],
         worker,
-    ) -> int:
+        task_status=None,
+    ) -> dict:
         """Different windows run concurrently; one window processes serially."""
-        rows = self.db.get_tasks(task_ids)
+        rows = [dict(row) for row in self.db.get_tasks(task_ids)]
         by_window, unassigned = group_tasks_by_window(rows)
         if unassigned:
             raise RuntimeError(
@@ -811,15 +931,28 @@ class MainWindow(QMainWindow):
             )
         groups = list(by_window.items())
         if not groups:
-            return 0
+            return {"completed": 0, "sent": 0, "failed": 0, "needs_review": 0}
         max_workers = min(MAX_CONCURRENT_TASKS, len(groups))
-        errors: list[str] = []
-        completed = 0
+        result = {"completed": 0, "sent": 0, "failed": 0, "needs_review": 0}
         lock = threading.Lock()
         total = len(task_ids)
 
+        def emit_final(task_id, default_label):
+            if task_status is None:
+                return
+            row = self.db.get_task(task_id)
+            email = row["recipient_email"] if row is not None else ""
+            profile = row["profile_no"] if row is not None else ""
+            status = row["status"] if row is not None else ""
+            label = {
+                "sent": tr("发送成功"),
+                "failed": tr("发送失败"),
+                "needs_review": tr("需要确认"),
+                "cancelled": tr("已取消"),
+            }.get(status, default_label)
+            task_status(str(profile), email, tr("完成"), label)
+
         def run_window(ce, pr, profile, group):
-            nonlocal completed
             with self._window_lock(profile):
                 for index, task_id in enumerate(group):
                     check_cancel(ce)
@@ -832,17 +965,54 @@ class MainWindow(QMainWindow):
                         worker(ce, pr, task_id)
                     except OperationCancelledError:
                         raise
-                    except Exception as exc:
-                        errors.append(str(exc))
+                    except Exception:
+                        row = self.db.get_task(task_id)
+                        status = row["status"] if row is not None else ""
+                        with lock:
+                            if status == "needs_review":
+                                result["needs_review"] += 1
+                            else:
+                                result["failed"] += 1
+                            result["completed"] += 1
+                            current = result["completed"]
+                        pr(
+                            int(current * 100 / total),
+                            tr("已完成 {completed}/{total} · 成功 {sent} · "
+                               "失败 {failed} · 需确认 {review}")
+                            .format(
+                                completed=current,
+                                total=total,
+                                sent=result["sent"],
+                                failed=result["failed"],
+                                review=result["needs_review"],
+                            ),
+                        )
+                        emit_final(task_id, tr("失败"))
+                        continue
+                    row = self.db.get_task(task_id)
+                    status = row["status"] if row is not None else ""
                     with lock:
-                        completed += 1
-                        current = completed
+                        if status == "sent":
+                            result["sent"] += 1
+                        elif status == "needs_review":
+                            result["needs_review"] += 1
+                        elif status == "failed":
+                            result["failed"] += 1
+                        result["completed"] += 1
+                        current = result["completed"]
                     pr(
-                        current,
-                        tr("已完成 {completed}/{total}").format(
-                            completed=current, total=total
+                        int(current * 100 / total),
+                        tr("已完成 {completed}/{total} · 成功 {sent} · "
+                           "失败 {failed} · 需确认 {review}")
+                        .format(
+                            completed=current,
+                            total=total,
+                            sent=result["sent"],
+                            failed=result["failed"],
+                            review=result["needs_review"],
                         ),
                     )
+                    emit_final(task_id, tr("完成"))
 
         with ThreadPoolExecutor(
             max_workers=max_workers,
@@ -861,9 +1031,7 @@ class MainWindow(QMainWindow):
                 for pending in futures:
                     pending.cancel()
                 raise
-        if errors:
-            raise RuntimeError(tr("部分任务失败：") + "；".join(errors[:5]))
-        return completed
+        return result
 
     def open_selected_drafts(
         self, wait_send: bool = False, forced_ids: list[int] | None = None
@@ -875,60 +1043,239 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择要填写草稿的联系人。"))
             return
         ids = self._cap_task_ids(ids)
-        if wait_send and self.settings.auto_send_confirm:
-            rows = self.db.get_tasks(ids)
-            windows = sorted(
-                {
-                    int(row["profile_no"])
-                    for row in rows
-                    if int(row.get("profile_no") or 0) > 0
-                }
-            )
-            window_text = ", ".join(map(str, windows)) or tr("未绑定")
-            answer = QMessageBox.question(
-                self,
-                tr("自动发送确认"),
-                tr("将自动发送 {count} 封邮件。\n"
-                   "浏览器窗口：{windows}\n\n"
-                   "发送前会重新校验 Gmail 中的收件人、主题与正文，确认后开始？")
-                .format(count=len(ids), windows=window_text),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if answer != QMessageBox.Yes:
+
+        matched_ids: list[int] = ids
+        waiting_ids: list[int] = []
+        pre_failed_count = 0
+        if wait_send:
+            rows = [dict(row) for row in self.db.get_tasks(ids)]
+            open_windows: list[int] = []
+            try:
+                provider = create_browser_provider(self.settings)
+                list_open = getattr(provider, "list_running_windows", None)
+                raw_windows = (
+                    list_open() if list_open is not None else provider.list_windows()
+                )
+                open_windows = [
+                    int(number)
+                    for number, _name in raw_windows
+                    if str(number).isdigit()
+                ]
+            except Exception as exc:
+                self.show_error(tr("读取窗口失败"), str(exc))
+                return
+            if not open_windows:
+                QMessageBox.warning(
+                    self,
+                    tr("没有可用窗口"),
+                    tr("未检测到已经打开并且可以连接的浏览器窗口。\n"
+                       "请先打开浏览器窗口后重试。"),
+                )
+                return
+            assignments = assign_windows(rows, open_windows)
+            matched_ids = []
+            waiting_ids = []
+            for item in assignments:
+                task_id = item["task_id"]
+                profile = item["profile_no"]
+                if profile is None:
+                    waiting_ids.append(task_id)
+                    if item["conflict"] == "window_not_open":
+                        self.db.update_task(
+                            task_id,
+                            status="needs_review",
+                            needs_manual_review=1,
+                            window_assignment_type=item["type"],
+                            last_error=tr("窗口 {window} 当前没有打开，请打开该浏览器窗口后重试")
+                            .format(window=item.get("requested_window") or ""),
+                            failure_stage="window_not_open",
+                        )
+                    elif item["conflict"] == "window_conflict":
+                        self.db.update_task(
+                            task_id,
+                            status="needs_review",
+                            needs_manual_review=1,
+                            window_assignment_type=item["type"],
+                            last_error=tr("窗口冲突：多个任务使用了同一窗口 {window}")
+                            .format(window=item.get("requested_window") or ""),
+                            failure_stage="window_conflict",
+                        )
+                    else:
+                        self.db.update_task(
+                            task_id,
+                            status="waiting_window",
+                            window_assignment_type=item["type"],
+                            last_error="",
+                            failure_stage="",
+                        )
+                else:
+                    matched_ids.append(task_id)
+                    self.db.update_task(
+                        task_id,
+                        status="assigned",
+                        profile_no=profile,
+                        assigned_at=now_iso(),
+                        window_assignment_type=item["type"],
+                        last_error="",
+                        failure_stage="",
+                    )
+            # Re-resolve sender after window assignment and re-render content.
+            pre_failed: list[int] = []
+            for item in assignments:
+                if item["profile_no"] is None:
+                    continue
+                task_id = item["task_id"]
+                row = dict(self.db.get_task(task_id))
+                if row.get("status") in {"sent", "replied"}:
+                    continue
+                candidate = dict(row)
+                candidate["profile_no"] = item["profile_no"]
+                profile_changed = (
+                    int(row.get("profile_no") or 0) != item["profile_no"]
+                )
+                context_changed = (
+                    str(row.get("render_context_hash") or "")
+                    != self.workflow._render_context_hash(candidate)
+                )
+                if profile_changed or context_changed:
+                    try:
+                        self.workflow.generate_local(task_id)
+                    except Exception as exc:
+                        pre_failed.append(task_id)
+                        self.db.update_task(
+                            task_id,
+                            status="failed",
+                            failure_stage="resolve_sender",
+                            last_error=str(exc),
+                        )
+            matched_ids = [
+                task_id
+                for task_id in matched_ids
+                if task_id not in pre_failed
+            ]
+            pre_failed_count = len(pre_failed)
+            if self.settings.auto_send_confirm:
+                manual_count = sum(
+                    1 for item in assignments if item["type"] in {"manual", "manual_locked"}
+                )
+                auto_count = sum(1 for item in assignments if item["type"] == "auto")
+                conflict_count = sum(1 for item in assignments if item["conflict"])
+                window_text = ", ".join(
+                    str(item["profile_no"]) for item in assignments if item["profile_no"]
+                ) or tr("无")
+                answer = QMessageBox.question(
+                    self,
+                    tr("自动发送确认"),
+                    tr("本次选择：{count} 封\n"
+                       "手动窗口：{manual} · 自动匹配：{auto}\n"
+                       "等待窗口：{waiting} · 无效/冲突：{conflict}\n"
+                       "实际执行：{matched} 封\n"
+                       "实际窗口：{windows}\n\n"
+                       "发送前会重新校验 Gmail 字段，确认后开始？")
+                    .format(
+                        count=len(ids),
+                        manual=manual_count,
+                        auto=auto_count,
+                        waiting=len(waiting_ids),
+                        conflict=conflict_count,
+                        matched=len(matched_ids),
+                        windows=window_text,
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+            if not matched_ids:
+                QMessageBox.information(
+                    self,
+                    tr("没有可执行任务"),
+                    tr("可用浏览器窗口不足，请先打开并连接浏览器窗口。"),
+                )
+                self.refresh_all()
                 return
 
-        def run(cancel_event, progress, task_ids, waiting):
+        def run(cancel_event, progress, task_status, task_ids, waiting):
             workflow = self.workflow
 
             def worker(ce, pr, task_id):
+                row = self.db.get_task(task_id)
+                email = row["recipient_email"] if row is not None else ""
+                profile = row["profile_no"] if row is not None else ""
+
+                def stage(value, text):
+                    task_status(str(profile), email, text, "")
+                    pr(
+                        -1,
+                        f"{tr('当前')}：{email} · {tr('窗口')}：{profile}\n{text}",
+                    )
+
                 if waiting:
                     return workflow.open_and_send(
                         task_id,
-                        progress=lambda value, text: pr(0, text),
+                        progress=stage,
                         cancel_event=ce,
                     )
                 return workflow.open_draft(
                     task_id,
-                    progress=lambda value, text: pr(0, text),
+                    progress=stage,
                     cancel_event=ce,
                 )
 
             if waiting:
                 return self._run_window_parallel(
-                    cancel_event, progress, task_ids, worker
+                    cancel_event,
+                    progress,
+                    task_ids,
+                    worker,
+                    task_status=task_status,
                 )
-            return self._run_tasks_parallel(
-                cancel_event, progress, task_ids, worker
+            return self._run_window_parallel(
+                cancel_event,
+                progress,
+                task_ids,
+                worker,
+                task_status=task_status,
             )
 
-        def done(count):
+        def done(result):
+            result = result or {}
+            result["failed"] = result.get("failed", 0) + pre_failed_count
             if wait_send:
-                self.set_status(tr("已自动发送 {count} 封邮件").format(count=count))
+                summary = tr("自动发送完成：成功 {sent} · 失败 {failed} · "
+                             "需确认 {review} · 等待窗口 {waiting}")
+                dialog = self._current_progress_dialog
+                if dialog is not None:
+                    dialog.finish(
+                        summary.format(
+                            sent=result.get("sent", 0),
+                            failed=result.get("failed", 0),
+                            review=result.get("needs_review", 0),
+                            waiting=len(waiting_ids),
+                        )
+                    )
+                self.set_status(
+                    summary.format(
+                        sent=result.get("sent", 0),
+                        failed=result.get("failed", 0),
+                        review=result.get("needs_review", 0),
+                        waiting=len(waiting_ids),
+                    )
+                )
             else:
+                count = result.get("completed", 0)
+                dialog = self._current_progress_dialog
+                if dialog is not None:
+                    dialog.finish(tr("已填写 {count} 封 Gmail 草稿").format(count=count))
                 self.set_status(tr("已填写 {count} 封 Gmail 草稿").format(count=count))
 
-        self.run_async(run, on_done=done, task_ids=ids, waiting=wait_send)
+        dialog = TaskProgressDialog(
+            self,
+            tr("填写并自动发送") if wait_send else tr("填写 Gmail 草稿"),
+        )
+        self._current_progress_dialog = dialog
+        dialog.show()
+        self.run_async(run, on_done=done, task_ids=matched_ids, waiting=wait_send)
 
     def send_single_task(self, task_id: int) -> None:
         self.open_selected_drafts(wait_send=True, forced_ids=[int(task_id)])
@@ -938,7 +1285,7 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择已发送的邮件。"))
             return
-        rows = self.db.get_tasks(ids)
+        rows = [dict(row) for row in self.db.get_tasks(ids)]
         allowed = [
             int(row["id"])
             for row in rows
@@ -963,6 +1310,106 @@ class MainWindow(QMainWindow):
         self.db.unmark_sent(ids)
         self.refresh_all()
         self.set_status(tr("已撤销 {count} 封邮件的发送标记").format(count=len(ids)))
+
+    def confirm_tasks_unsent(self) -> None:
+        ids = list(dict.fromkeys(
+            self.pages[0].draft_task_ids() + self._selected_ids()
+        ))
+        if not ids:
+            QMessageBox.information(self, tr("未选择任务"), tr("请先选择需要人工确认的任务。"))
+            return
+        rows = [dict(row) for row in self.db.get_tasks(ids)]
+        review_ids = [
+            int(row["id"]) for row in rows if row.get("status") == "needs_review"
+        ]
+        if not review_ids:
+            QMessageBox.information(
+                self,
+                tr("没有可确认任务"),
+                tr("所选任务中没有需要人工确认（needs_review）的任务。"),
+            )
+            return
+        skipped = len(ids) - len(review_ids)
+        emails = "\n".join(
+            str(row["recipient_email"])
+            for row in rows
+            if row.get("status") == "needs_review"
+        )
+        answer = QMessageBox.question(
+            self,
+            tr("确认未发送"),
+            tr("确认以下 {count} 个任务在 Gmail 中尚未发送？\n\n{emails}")
+            .format(count=len(review_ids), emails=emails)
+            + (tr("\n\n另有 {skipped} 个非人工确认任务已跳过。").format(skipped=skipped) if skipped else ""),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for task_id in review_ids:
+            self.db.update_task(
+                task_id,
+                status="generated",
+                send_attempt_started_at="",
+                send_clicked_at="",
+                needs_manual_review=0,
+                last_error="",
+                failure_stage="",
+            )
+        self.refresh_all()
+        self.set_status(
+            tr("已确认未发送，{count} 个任务可重新执行").format(count=len(review_ids))
+        )
+
+    def confirm_tasks_sent(self) -> None:
+        ids = list(dict.fromkeys(
+            self.pages[0].draft_task_ids() + self._selected_ids()
+        ))
+        if not ids:
+            QMessageBox.information(self, tr("未选择任务"), tr("请先选择需要人工确认的任务。"))
+            return
+        rows = [dict(row) for row in self.db.get_tasks(ids)]
+        review_ids = [
+            int(row["id"]) for row in rows if row.get("status") == "needs_review"
+        ]
+        if not review_ids:
+            QMessageBox.information(
+                self,
+                tr("没有可确认任务"),
+                tr("所选任务中没有需要人工确认（needs_review）的任务。"),
+            )
+            return
+        skipped = len(ids) - len(review_ids)
+        emails = "\n".join(
+            str(row["recipient_email"])
+            for row in rows
+            if row.get("status") == "needs_review"
+        )
+        answer = QMessageBox.question(
+            self,
+            tr("确认已发送"),
+            tr("确认以下 {count} 个任务已在 Gmail 发送成功？\n\n{emails}")
+            .format(count=len(review_ids), emails=emails)
+            + (tr("\n\n另有 {skipped} 个非人工确认任务已跳过。").format(skipped=skipped) if skipped else ""),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for task_id in review_ids:
+            self.db.update_task(
+                task_id,
+                status="sent",
+                sent_at=now_iso(),
+                sent_method="manual",
+                needs_manual_review=0,
+                last_error="",
+                failure_stage="",
+            )
+        self.refresh_all()
+        self.set_status(
+            tr("已确认在 Gmail 中发送成功，共 {count} 封").format(count=len(review_ids))
+        )
 
     def unmark_selected_history(self) -> None:
         ids = self.pages[3].selected_task_ids()
@@ -1029,19 +1476,34 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("没有失败任务"), tr("当前没有可重试的失败任务。"))
             return
 
-        def run(cancel_event, progress, task_ids):
+        def run(cancel_event, progress, task_status, task_ids):
             workflow = self.workflow
 
             def worker(ce, pr, task_id):
+                row = self.db.get_task(task_id)
+                email = row["recipient_email"] if row is not None else ""
+                profile = row["profile_no"] if row is not None else ""
+
+                def stage(value, text):
+                    task_status(str(profile), email, text, "")
+                    pr(
+                        -1,
+                        f"{tr('当前')}：{email} · {tr('窗口')}：{profile}\n{text}",
+                    )
+
                 workflow.generate_local(task_id, cancel_event=ce)
                 return workflow.open_and_send(
                     task_id,
-                    progress=lambda value, text: pr(0, text),
+                    progress=stage,
                     cancel_event=ce,
                 )
 
             return self._run_window_parallel(
-                cancel_event, progress, task_ids, worker
+                cancel_event,
+                progress,
+                task_ids,
+                worker,
+                task_status=task_status,
             )
 
         self.run_async(run, task_ids=ids)
@@ -1128,6 +1590,9 @@ class MainWindow(QMainWindow):
         def run(cancel_event, progress):
             progress(0, tr("正在读取浏览器窗口…"))
             provider = create_browser_provider(self.settings)
+            list_open = getattr(provider, "list_running_windows", None)
+            if list_open is not None:
+                return list_open(verify_connection=True)
             return provider.list_windows()
 
         def done(windows):
@@ -1314,10 +1779,12 @@ class MainWindow(QMainWindow):
             (tr("导入联系人"), tr("Ctrl+I"), self.import_contacts),
             (tr("新增联系人"), "", self.add_contact),
             (tr("生成所选邮件预览"), tr("Ctrl+Enter"), self.generate_selected),
-            (tr("打开 Gmail 草稿"), tr("Ctrl+D"), lambda: self.open_selected_drafts(False)),
+            (tr("填写草稿"), tr("Ctrl+D"), lambda: self.open_selected_drafts(False)),
             (tr("填写并自动发送"), "", lambda: self.open_selected_drafts(True)),
             (tr("标记所选为已发送"), "", self.mark_selected_sent),
             (tr("撤销已发送标记"), "", self.unmark_selected),
+            (tr("确认未发送并可重试"), "", self.confirm_tasks_unsent),
+            (tr("确认已在 Gmail 发送成功"), "", self.confirm_tasks_sent),
             (tr("重试失败草稿"), "", self.retry_failed_drafts),
             (tr("停止当前操作"), "", self.cancel_operation),
             (tr("删除所选联系人"), "", self.delete_selected),

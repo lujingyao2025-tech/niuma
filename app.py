@@ -103,7 +103,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NiuMaMail.0.90.0")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NiuMaMail.0.91.0")
         except OSError:
             pass
     main()

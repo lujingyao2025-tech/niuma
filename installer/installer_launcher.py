@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 APP_NAME = "牛马邮箱"
-APP_VERSION = "0.90.0"
+APP_VERSION = "0.91.0"
 EXE_NAME = "NiuMaMail.exe"
 UNINSTALL_VBS = "uninstall.vbs"
 REG_PATH = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\NiuMaMail"

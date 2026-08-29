@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import threading
@@ -10,9 +11,11 @@ from .browser import (
     BrowserAutomationError,
     click_gmail_send,
     connected_browser,
+    gmail_alert_baseline,
     prepare_gmail_draft,
     save_failure_screenshot,
     verify_draft_fields,
+    wait_for_gmail_alerts_clear,
     wait_for_gmail_send,
 )
 from .config import Settings
@@ -43,6 +46,13 @@ STAGE_LABELS = {
     "send_failed": "Gmail提示发送失败",
     "network": "网络或浏览器连接中断",
     "cancelled": "用户取消任务",
+}
+
+SENDER_SOURCE_LABELS = {
+    "task": "任务指定",
+    "window": "窗口锁定",
+    "template": "模板",
+    "default": "软件默认",
 }
 
 
@@ -151,8 +161,13 @@ class Workflow:
                 }
         custom_variables = dict(self.settings.custom_variables)
         custom_variables.update(task_custom)
+        resolved_sender, sender_source = self._resolve_sender(task)
         subject, body = self._render_email_for_task(
-            task, contact_name, clean_location, custom_variables
+            task,
+            contact_name,
+            clean_location,
+            custom_variables,
+            resolved_sender=resolved_sender,
         )
         check_cancel(cancel_event)
         self.db.update_task(
@@ -162,6 +177,9 @@ class Workflow:
             location=clean_location,
             location_source="manual",
             sender_name_override=clean_sender,
+            resolved_sender_name=resolved_sender,
+            sender_name_source=sender_source,
+            render_context_hash=self._render_context_hash(task),
             subject=subject,
             body=body,
             source_urls="[]",
@@ -188,6 +206,15 @@ class Workflow:
                 ),
                 None,
             )
+        if template is None and getattr(self.settings, "active_template_name", ""):
+            template = next(
+                (
+                    item
+                    for item in self.settings.saved_templates
+                    if item.get("name") == self.settings.active_template_name
+                ),
+                None,
+            )
         return template, binding
 
     def _render_email_for_task(
@@ -196,6 +223,7 @@ class Workflow:
         contact_name: str,
         location: str,
         custom_variables: dict[str, str],
+        resolved_sender: str | None = None,
     ) -> tuple[str, str]:
         """Render with the window-bound template first, then the active template."""
         template, binding = self._draft_template(task)
@@ -207,7 +235,8 @@ class Workflow:
             )
             body_template = template.get("body_template") or self.settings.body_template
             sender = (
-                task_sender
+                resolved_sender
+                or task_sender
                 or binding.get("sender_name")
                 or template.get("sender_name")
                 or self.settings.sender_name
@@ -219,7 +248,8 @@ class Workflow:
             subject_template = self.settings.subject_template
             body_template = self.settings.body_template
             sender = (
-                task_sender
+                resolved_sender
+                or task_sender
                 or binding.get("sender_name")
                 or self.settings.sender_name
             )
@@ -236,6 +266,58 @@ class Workflow:
         if signature:
             body = body.rstrip() + "\n\n" + signature.strip()
         return subject, body
+
+    def _resolve_sender(self, task) -> tuple[str, str]:
+        """Priority: task > locked window > template > default."""
+        task_sender = _row_value(task, "sender_name_override").strip()
+        if task_sender:
+            return task_sender, "task"
+        profile = str(task["profile_no"] or "")
+        binding = (self.settings.window_bindings or {}).get(profile) or {}
+        window_sender = str(binding.get("sender_name") or "").strip()
+        if binding.get("locked") and window_sender:
+            return window_sender, "window"
+        template, _binding = self._draft_template(task)
+        template_sender = ""
+        if template:
+            template_sender = str(template.get("sender_name") or "").strip()
+        if template_sender:
+            return template_sender, "template"
+        default_sender = str(getattr(self.settings, "sender_name", "") or "").strip()
+        return default_sender, "default"
+
+    def _render_context_hash(self, task) -> str:
+        """Hash everything that affects rendered subject/body/sender."""
+        profile = str(task["profile_no"] or "")
+        template, _binding = self._draft_template(task)
+        template_payload: dict = {}
+        if template:
+            template_payload = {
+                "name": template.get("name"),
+                "subject": template.get("subject_template"),
+                "body": template.get("body_template"),
+                "signature": template.get("signature"),
+                "sender": template.get("sender_name"),
+            }
+        sender, source = self._resolve_sender(task)
+        payload = {
+            "profile": profile,
+            "template": template_payload,
+            "subject_template": self.settings.subject_template,
+            "body_template": self.settings.body_template,
+            "signature": self.settings.signature,
+            "custom_variables": self.settings.custom_variables,
+            "task_sender_override": _row_value(task, "sender_name_override"),
+            "resolved_sender": sender,
+            "sender_source": source,
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def open_draft(
         self,
@@ -308,13 +390,24 @@ class Workflow:
         if int(task["profile_no"] or 0) <= 0:
             raise ValueError("请在邮件预览下方选择并确认浏览器窗口")
         subject, body = str(task["subject"] or ""), str(task["body"] or "")
+        resolved_sender, sender_source = self._resolve_sender(task)
+        self.db.update_task(
+            task_id,
+            status="assigned",
+            assigned_at=now_iso(),
+            resolved_sender_name=resolved_sender,
+            sender_name_source=sender_source,
+            window_assignment_type=(
+                _row_value(task, "window_assignment_type") or "auto"
+            ),
+            browser_type=self.settings.browser_provider,
+            last_error="",
+            failure_stage="",
+        )
         self.db.update_task(
             task_id,
             status="filling",
             fill_started_at=now_iso(),
-            browser_type=self.settings.browser_provider,
-            last_error="",
-            failure_stage="",
         )
         trace_execution(
             task_id, "start", "开始自动发送", profile_no=task["profile_no"]
@@ -354,6 +447,11 @@ class Workflow:
                 profile_no=task["profile_no"],
             )
             try:
+                self.db.update_task(
+                    task_id,
+                    status="validating",
+                    validation_at=now_iso(),
+                )
                 if not verify_draft_fields(
                     browser,
                     task["recipient_email"],
@@ -378,8 +476,31 @@ class Workflow:
                 raise
             auto_send = getattr(self.settings, "auto_click_send", True)
             if auto_send:
+                baseline = gmail_alert_baseline(browser)
+                try:
+                    wait_for_gmail_alerts_clear(
+                        browser, baseline=baseline, cancel_event=cancel_event
+                    )
+                except OperationCancelledError:
+                    self._mark_cancelled(task_id)
+                    raise
+                except Exception as exc:
+                    self._record_failure(task_id, exc, "stale_toast")
+                    save_failure_screenshot(
+                        browser, task_id, task["profile_no"], "stale_toast"
+                    )
+                    raise
+                self.db.update_task(
+                    task_id,
+                    status="sending",
+                    send_attempt_started_at=now_iso(),
+                )
                 try:
                     click_gmail_send(browser, cancel_event=cancel_event)
+                    self.db.update_task(
+                        task_id,
+                        send_clicked_at=now_iso(),
+                    )
                 except OperationCancelledError:
                     self._mark_cancelled(task_id)
                     raise
@@ -389,16 +510,19 @@ class Workflow:
                         if "发送按钮" in str(exc)
                         else "click_send"
                     )
-                    self._record_failure(task_id, exc, stage)
+                    if stage == "send_button":
+                        self._record_failure(task_id, exc, stage)
+                    else:
+                        # Click outcome is unknown: never allow auto-retry.
+                        self.db.update_task(
+                            task_id,
+                            send_clicked_at=now_iso(),
+                        )
+                        self._mark_needs_review(task_id, exc, stage)
                     save_failure_screenshot(
                         browser, task_id, task["profile_no"], stage
                     )
                     raise
-                self.db.update_task(
-                    task_id,
-                    status="sending",
-                    send_clicked_at=now_iso(),
-                )
                 trace_execution(
                     task_id, "send_clicked", "已点击 Gmail 发送按钮",
                     profile_no=task["profile_no"],
@@ -412,7 +536,10 @@ class Workflow:
                         if "超时" in str(exc)
                         else "send_failed"
                     )
-                    self._record_failure(task_id, exc, stage)
+                    if stage == "wait_send":
+                        self._mark_needs_review(task_id, exc, stage)
+                    else:
+                        self._record_failure(task_id, exc, stage)
                     save_failure_screenshot(
                         browser, task_id, task["profile_no"], stage
                     )
@@ -424,6 +551,8 @@ class Workflow:
             status="sent",
             sent_at=now_iso(),
             drafted_at=now_iso(),
+            sent_method="confirmed",
+            needs_manual_review=0,
             last_error="",
             failure_stage="",
         )
@@ -432,6 +561,22 @@ class Workflow:
             profile_no=task["profile_no"],
         )
         return accuracy
+
+    def _mark_needs_review(self, task_id: int, exc: Exception, stage: str) -> None:
+        logging.getLogger("niuma-mail").warning(
+            "任务 %s 结果不明确（%s）：%s", task_id, stage, exc
+        )
+        try:
+            self.db.update_task(
+                task_id,
+                status="needs_review",
+                needs_manual_review=1,
+                last_error=str(exc),
+                failure_stage=stage,
+                last_failed_at=now_iso(),
+            )
+        except Exception:
+            pass
 
     def open_draft_wait_send(
         self,
@@ -472,12 +617,29 @@ class Workflow:
         try:
             row = self.db.get_task(task_id)
             profile = int(row["profile_no"]) if row is not None else None
+            context = {}
+            if row is not None:
+                context = {
+                    "联系人邮箱": _row_value(row, "recipient_email"),
+                    "联系人姓名": (
+                        _row_value(row, "name_override")
+                        or _row_value(row, "first_name")
+                    ),
+                    "浏览器类型": (
+                        _row_value(row, "browser_type")
+                        or self.settings.browser_provider
+                    ),
+                    "窗口编号": profile,
+                    "窗口分配方式": _row_value(row, "window_assignment_type"),
+                    "实际发件人姓名": _row_value(row, "resolved_sender_name"),
+                    "发件人姓名来源": _row_value(row, "sender_name_source"),
+                }
             trace_execution(
                 task_id,
                 stage or "unknown",
                 str(exc),
                 profile_no=profile,
-                extra={"exception": type(exc).__name__},
+                extra={"exception": type(exc).__name__, **context},
             )
             write_error_report(
                 exc,
@@ -486,6 +648,7 @@ class Workflow:
                 profile_no=profile,
                 settings=self.settings,
                 extra_trail=recent_trail(task_id, limit=30),
+                context=context,
             )
             attempts = int(row["attempts"] or 0) if row is not None else 0
             self.db.update_task(
@@ -515,4 +678,8 @@ class Workflow:
             raise ValueError("请先在本地生成邮件预览")
         if task["status"] in {"sent", "replied"}:
             raise ValueError("该任务已经标记为已发送，禁止重复发送")
+        if _row_value(task, "send_clicked_at"):
+            raise ValueError(
+                "该任务已进入发送流程且结果不明确，禁止直接重发；请先人工确认 Gmail"
+            )
         return task

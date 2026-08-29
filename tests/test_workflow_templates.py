@@ -2,6 +2,11 @@ import unittest
 import sqlite3
 import threading
 
+try:
+    import playwright  # noqa: F401
+except ImportError:
+    raise unittest.SkipTest("playwright not installed")
+
 from ophelia_assistant.config import Settings, resolve_task_windows_balanced
 from ophelia_assistant.workflow import Workflow
 

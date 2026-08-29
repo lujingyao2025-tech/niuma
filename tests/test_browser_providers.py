@@ -1,5 +1,10 @@
 import unittest
 
+try:
+    import requests  # noqa: F401
+except ImportError:
+    raise unittest.SkipTest("requests not installed")
+
 from ophelia_assistant.morelogin import (
     AdsPowerClient,
     BitBrowserClient,

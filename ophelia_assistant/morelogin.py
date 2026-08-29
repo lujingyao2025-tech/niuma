@@ -41,6 +41,8 @@ class BrowserProvider(Protocol):
 
     def list_windows(self) -> list[tuple[str, str]]: ...
 
+    def list_running_windows(self) -> list[tuple[str, str]]: ...
+
 
 _CDP_DIRECT_KEYS = (
     "cdpUrl",
@@ -65,6 +67,58 @@ _DEBUG_PORT_KEYS = (
     "remote_debugging_port",
     "remoteDebuggingPort",
 )
+
+
+def _cdp_value(row: dict) -> str:
+    for key in (
+        "cdpUrl",
+        "wsEndpoint",
+        "webSocketDebuggerUrl",
+        "debuggerAddress",
+        "debugPort",
+        "debug_port",
+        "remoteDebuggingPort",
+        "remote_debugging_port",
+        "cdp",
+        "ws",
+    ):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _cdp_reachable(value: str, timeout: float = 2.0) -> bool:
+    """Lightweight TCP reachability check for a CDP host:port endpoint."""
+    import socket
+
+    text = value.strip()
+    if text.startswith(("ws://", "wss://", "http://", "https://")):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(text)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme in {"wss", "https"} else 80)
+    else:
+        if text.isdigit():
+            host = "127.0.0.1"
+            port = int(text)
+        else:
+            if ":" not in text:
+                return False
+            host, port_text = text.rsplit(":", 1)
+            try:
+                port = int(port_text)
+            except ValueError:
+                return False
+            host = host.strip("[]")
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _normalize_cdp(value: object) -> str:
@@ -215,6 +269,44 @@ class MoreLoginClient:
                     )
         except (requests.RequestException, ValueError):
             pass
+        return windows
+
+    def list_running_windows(
+        self, verify_connection: bool = True
+    ) -> list[tuple[str, str]]:
+        windows: list[tuple[str, str]] = []
+        status_keys = ("status", "running", "opened", "is_open", "online")
+        running_values = {True, 1, "1", "running", "online", "opened", "open", "active"}
+        try:
+            response = requests.get(f"{self.base_url}/api/env/list", timeout=5)
+            payload = response.json()
+            data = payload.get("data") or {}
+            rows = data.get("list") if isinstance(data, dict) else data
+            if not isinstance(rows, list):
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                number = row.get("uniqueId") or row.get("envId") or row.get("id")
+                if number is None:
+                    continue
+                if not any(key in row for key in status_keys):
+                    continue
+                cdp = _cdp_value(row)
+                if not cdp or (verify_connection and not _cdp_reachable(cdp)):
+                    continue
+                status = row.get("status") or row.get("running") or row.get("opened") or row.get("is_open") or row.get("online")
+                if status in running_values:
+                    windows.append(
+                        (
+                            str(number),
+                            str(row.get("name") or row.get("envName") or ""),
+                        )
+                    )
+        except (requests.RequestException, ValueError):
+            pass
+        if not windows:
+            self.last_error = "MoreLogin 未返回已打开窗口状态，请确认窗口已启动"
         return windows
 
 
@@ -613,6 +705,35 @@ class AdsPowerClient:
                 windows.append((str(number), str(profile.get("name") or "")))
         return windows
 
+    def list_running_windows(
+        self, verify_connection: bool = True
+    ) -> list[tuple[str, str]]:
+        windows: list[tuple[str, str]] = []
+        running_values = {True, 1, "1", "running", "online", "opened", "open", "active", "Active"}
+        try:
+            profiles = self._profiles or self._load_profiles()
+        except BrowserProviderError:
+            profiles = []
+        for profile in profiles:
+            number = profile.get("serial_number") or profile.get("user_id")
+            if not number:
+                continue
+            status = (
+                profile.get("status")
+                or profile.get("browser_status")
+                or profile.get("online")
+            )
+            if status is None:
+                continue
+            cdp = _cdp_value(profile)
+            if not cdp or (verify_connection and not _cdp_reachable(cdp)):
+                continue
+            if status in running_values:
+                windows.append((str(number), str(profile.get("name") or "")))
+        if not windows:
+            self.last_error = "AdsPower 未返回已打开窗口状态，请确认窗口已启动"
+        return windows
+
 
 class BitBrowserClient:
     display_name = BROWSER_PROVIDER_NAMES["bitbrowser"]
@@ -797,6 +918,31 @@ class BitBrowserClient:
             number = profile.get("seq")
             if number is not None:
                 windows.append((str(number), str(profile.get("name") or "")))
+        return windows
+
+    def list_running_windows(
+        self, verify_connection: bool = True
+    ) -> list[tuple[str, str]]:
+        windows: list[tuple[str, str]] = []
+        running_values = {True, 1, "1", "running", "online", "opened", "open", "active"}
+        try:
+            profiles = self._profiles or self._load_profiles(1)
+        except BrowserProviderError:
+            profiles = []
+        for profile in profiles:
+            number = profile.get("seq")
+            if number is None:
+                continue
+            status = profile.get("status") or profile.get("online")
+            if status is None:
+                continue
+            cdp = _cdp_value(profile)
+            if not cdp or (verify_connection and not _cdp_reachable(cdp)):
+                continue
+            if status in running_values:
+                windows.append((str(number), str(profile.get("name") or "")))
+        if not windows:
+            self.last_error = "BitBrowser 未返回已打开窗口状态，请确认窗口已启动"
         return windows
 
 

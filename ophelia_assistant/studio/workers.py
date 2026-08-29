@@ -16,6 +16,7 @@ logger = logging.getLogger("niuma-mail")
 
 class WorkerSignals(QObject):
     progress = Signal(int, str)
+    task_status = Signal(str, str, str, str)
     done = Signal(object)
     error = Signal(object)
     finished = Signal()
