@@ -467,6 +467,47 @@ def _save_failure_screenshot(page: Page, label: str) -> str:
         return ""
 
 
+def save_failure_screenshot(
+    browser: Browser,
+    task_id: int,
+    profile_no: int,
+    stage: str,
+) -> str:
+    """Save a task-scoped failure screenshot with id/window/stage in the name."""
+    try:
+        page = _compose_page(browser) or _gmail_page(browser)
+    except BrowserAutomationError:
+        return ""
+    label = f"task_{task_id}_window_{profile_no}_{stage}"
+    return _save_failure_screenshot(page, label)
+
+
+def _send_button_selectors() -> tuple[str, ...]:
+    """Multiple Gmail Send button strategies; used only inside compose scope."""
+    return (
+        'div[role="button"][aria-label^="Send" i]',
+        'div[role="button"][aria-label^="发送" i]',
+        'div[role="button"][aria-label^="寄出" i]',
+        'div[role="button"][aria-label^="送出" i]',
+        'div[role="button"][data-tooltip^="Send" i]',
+        'div[role="button"][data-tooltip^="发送" i]',
+        'div[role="button"][data-tooltip^="寄出" i]',
+        'div[role="button"][data-tooltip*="send" i]',
+        'button[aria-label^="Send" i]',
+        'button[aria-label^="发送" i]',
+        'button[aria-label^="寄出" i]',
+        '[gh="cm"] [role="button"][aria-label*="Send" i]',
+    )
+
+
+SUCCESS_PROMPT_RE = re.compile(
+    r"Message sent|邮件已发送|已发送|已寄出|寄出", re.I
+)
+FAILURE_PROMPT_RE = re.compile(
+    r"发送失败|无法发送|Error sending|Did not send|出错了|发生错误", re.I
+)
+
+
 def _prepare_gmail_draft_on_page(
     browser: Browser,
     page: Page,
@@ -567,25 +608,36 @@ def click_gmail_send(
     browser: Browser,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Click the Gmail compose Send button (opt-in automation)."""
+    """Click the Gmail compose Send button inside the active compose only."""
     page = _compose_page(browser) or _gmail_page(browser)
+    scope = _compose_scope(page, cancel_event)
     deadline = time.monotonic() + 12
+    last_error = ""
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
         try:
-            button = page.locator(
-                'div[role="button"][aria-label^="Send" i], '
-                'div[role="button"][aria-label^="发送" i], '
-                'div[role="button"][aria-label^="送信" i], '
-                'div[role="button"][aria-label="Send" i]'
-            ).last
-            if button.is_visible():
-                button.click()
-                return
-        except PlaywrightError:
-            pass
+            locators = [scope.locator(selector) for selector in _send_button_selectors()]
+            locators.append(
+                scope.get_by_role(
+                    "button",
+                    name=re.compile(r"^(Send|发送|寄出|送出|寄送)$", re.I),
+                )
+            )
+            for locator in locators:
+                for index in range(locator.count() - 1, -1, -1):
+                    candidate = locator.nth(index)
+                    try:
+                        if candidate.is_visible() and candidate.is_enabled():
+                            candidate.click()
+                            return
+                    except PlaywrightError as exc:
+                        last_error = str(exc)
+        except PlaywrightError as exc:
+            last_error = str(exc)
         time.sleep(0.3)
-    raise BrowserAutomationError("找不到 Gmail 发送按钮，未自动发送")
+    raise BrowserAutomationError(
+        f"找不到可用的 Gmail 发送按钮，未自动发送（{last_error or '按钮不可见'}）"
+    )
 
 
 def wait_for_gmail_send(
@@ -593,7 +645,7 @@ def wait_for_gmail_send(
     timeout_ms: int = 300_000,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Wait until Gmail shows the transient sent toast (role=alert only)."""
+    """Wait until Gmail shows a send success toast; fail on explicit errors."""
     page = _compose_page(browser) or _gmail_page(browser)
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -603,7 +655,12 @@ def wait_for_gmail_send(
         except PlaywrightError:
             alerts = []
         for alert in alerts:
-            if re.search(r"Message sent|已发送|已寄出", str(alert), re.I):
+            alert_text = str(alert)
+            if FAILURE_PROMPT_RE.search(alert_text):
+                raise BrowserAutomationError(
+                    f"Gmail 提示发送失败：{alert_text[:200]}"
+                )
+            if SUCCESS_PROMPT_RE.search(alert_text):
                 return
         time.sleep(1)
     raise BrowserAutomationError(

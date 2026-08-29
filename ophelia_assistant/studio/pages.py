@@ -30,6 +30,7 @@ from .models import CampaignListModel, HistoryModel
 from .panels import (
     CampaignItemDelegate,
     PageHeader,
+    StatsBar,
     TaskInspector,
     TaskTablePanel,
     TemplateEditor,
@@ -197,13 +198,15 @@ class ActivityPage(QWidget):
         self.workspace_summary = QLabel("")
         self.workspace_summary.setObjectName("subtle")
         workspace_layout.addWidget(self.workspace_summary)
+        self.stats_bar = StatsBar()
+        workspace_layout.addWidget(self.stats_bar)
 
         actions = QHBoxLayout()
         self.import_button = QPushButton(tr("导入联系人"))
         self.import_button.setProperty("class", "primary")
         self.import_button.clicked.connect(self.window.import_contacts)
-        add_contact = QPushButton(tr("新增联系人"))
-        add_contact.clicked.connect(self.window.add_contact)
+        self.add_contact_button = QPushButton(tr("新增联系人"))
+        self.add_contact_button.clicked.connect(self.window.add_contact)
         self.generate_button = QPushButton(tr("生成所选"))
         self.generate_button.clicked.connect(self.window.generate_selected)
         self.open_draft_button = QPushButton(tr("打开 Gmail 草稿"))
@@ -213,7 +216,7 @@ class ActivityPage(QWidget):
         more_button = QPushButton(tr("更多操作"))
         more_button.clicked.connect(self._more_menu)
         actions.addWidget(self.import_button)
-        actions.addWidget(add_contact)
+        actions.addWidget(self.add_contact_button)
         actions.addWidget(self.generate_button)
         actions.addWidget(self.open_draft_button)
         actions.addStretch(1)
@@ -260,7 +263,7 @@ class ActivityPage(QWidget):
         toolbar = QHBoxLayout()
         open_draft = QPushButton(tr("打开 Gmail 草稿"))
         open_draft.clicked.connect(lambda: self.window.open_selected_drafts(wait_send=False))
-        wait_send = QPushButton(tr("打开并等待发送"))
+        wait_send = QPushButton(tr("填写并自动发送"))
         wait_send.clicked.connect(lambda: self.window.open_selected_drafts(wait_send=True))
         mark_sent = QPushButton(tr("标记已发送"))
         mark_sent.clicked.connect(self.window.mark_selected_sent)
@@ -280,7 +283,7 @@ class ActivityPage(QWidget):
 
     def _more_menu(self) -> None:
         menu = QMenu(self)
-        menu.addAction(tr("等待发送（打开并确认）"), lambda: self.window.open_selected_drafts(wait_send=True))
+        menu.addAction(tr("填写并自动发送"), lambda: self.window.open_selected_drafts(wait_send=True))
         menu.addAction(tr("标记所选为已发送"), self.window.mark_selected_sent)
         menu.addAction(tr("撤销已发送标记"), self.window.unmark_selected)
         menu.addSeparator()
@@ -295,6 +298,9 @@ class ActivityPage(QWidget):
 
     def set_draft_tasks(self, rows) -> None:
         self._draft_model.set_tasks(rows)
+
+    def set_stats(self, stats: dict[str, int]) -> None:
+        self.stats_bar.set_stats(stats)
 
     def selected_task_ids(self) -> list[int]:
         return self.contacts_panel.selected_ids()
@@ -512,6 +518,10 @@ class SettingsPage(QWidget):
             tr("填写完成后自动点击发送（需先确认收件人与内容）")
         )
         form.addRow("", self.auto_send_check)
+        self.auto_confirm_check = QCheckBox(
+            tr("自动发送前弹出确认窗口（显示任务数量与浏览器窗口）")
+        )
+        form.addRow("", self.auto_confirm_check)
         form_layout.addLayout(form)
         save_button = QPushButton(tr("保存设置"))
         save_button.setProperty("class", "primary")
@@ -599,6 +609,7 @@ class SettingsPage(QWidget):
             max(0, self.theme_combo.findData(settings.theme_mode))
         )
         self.auto_send_check.setChecked(bool(settings.auto_click_send))
+        self.auto_confirm_check.setChecked(bool(settings.auto_send_confirm))
         from ..trial import device_code, remaining_text
 
         self.device_code_edit.setText(device_code())
@@ -615,6 +626,7 @@ class SettingsPage(QWidget):
         settings.language = str(self.language_combo.currentData() or "zh")
         settings.theme_mode = str(self.theme_combo.currentData() or "light")
         settings.auto_click_send = self.auto_send_check.isChecked()
+        settings.auto_send_confirm = self.auto_confirm_check.isChecked()
         try:
             settings.save()
         except Exception as exc:

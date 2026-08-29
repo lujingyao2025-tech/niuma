@@ -17,12 +17,16 @@ from ..i18n import tr
 
 
 STATUS_TEXT = {
-    "new": "新任务",
-    "ready": "待确认",
-    "needs_review": "需要手动修改",
+    "pending": "待处理",
+    "generated": "已生成",
+    "filling": "正在填写",
     "drafted": "Gmail 草稿",
+    "sending": "正在发送",
     "sent": "已发送",
     "replied": "已回复",
+    "failed": "发送失败",
+    "cancelled": "已取消",
+    "needs_review": "需要手动修改",
 }
 
 

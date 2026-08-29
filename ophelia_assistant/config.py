@@ -268,7 +268,8 @@ class Settings:
     window_bindings: dict[str, dict] = field(default_factory=dict)
     update_url: str = ""
     window_sequence: list[int] = field(default_factory=list)
-    auto_click_send: bool = False
+    auto_click_send: bool = True
+    auto_send_confirm: bool = True
 
     def __post_init__(self) -> None:
         if self.browser_provider not in {"morelogin", "adspower", "bitbrowser"}:

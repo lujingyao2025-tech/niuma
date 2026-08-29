@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     source_urls TEXT DEFAULT '[]',
     review_reason TEXT DEFAULT '',
     custom_variables TEXT DEFAULT '{}',
-    status TEXT DEFAULT 'new',
+    status TEXT DEFAULT 'pending',
     created_at TEXT NOT NULL,
     sent_at TEXT,
     replied_at TEXT,
@@ -111,12 +111,28 @@ class Database:
                 conn.execute("DROP TABLE tasks_legacy_source")
             if "campaign_id" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER")
+            final_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            for column, definition in (
+                ("fill_started_at", "TEXT"),
+                ("send_clicked_at", "TEXT"),
+                ("last_failed_at", "TEXT"),
+                ("failure_stage", "TEXT DEFAULT ''"),
+                ("browser_type", "TEXT DEFAULT ''"),
+            ):
+                if column not in final_columns:
+                    conn.execute(
+                        f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
+                    )
             default_id = self._default_campaign_id(conn)
             conn.execute(
                 "UPDATE tasks SET campaign_id = ? "
                 "WHERE campaign_id IS NULL OR campaign_id = 0",
                 (default_id,),
             )
+            conn.execute("UPDATE tasks SET status='pending' WHERE status='new'")
+            conn.execute("UPDATE tasks SET status='generated' WHERE status='ready'")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -182,8 +198,9 @@ class Database:
                         """INSERT INTO tasks(
                             profile_no, source_key, recipient_email,
                             name_override, location_override, location,
-                            location_source, custom_variables, campaign_id, created_at
-                        ) VALUES(0, '', ?, ?, ?, ?, 'manual', ?, ?, ?)""",
+                            location_source, custom_variables, campaign_id,
+                            status, created_at
+                        ) VALUES(0, '', ?, ?, ?, ?, 'manual', ?, ?, 'pending', ?)""",
                         (
                             normalized_email,
                             normalized_name,
@@ -217,6 +234,32 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
 
+    def stats(self) -> dict[str, int]:
+        """Global mutually-exclusive task counts for the studio stats strip."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'generated' THEN 1 ELSE 0 END) AS generated,
+                    SUM(CASE WHEN status IN ('filling', 'drafted', 'sending')
+                        THEN 1 ELSE 0 END) AS processing,
+                    SUM(CASE WHEN status IN ('sent', 'replied')
+                        THEN 1 ELSE 0 END) AS sent,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status IN ('cancelled', 'needs_review')
+                        THEN 1 ELSE 0 END) AS other
+                FROM tasks"""
+            ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "pending": int(row["pending"] or 0),
+            "generated": int(row["generated"] or 0),
+            "processing": int(row["processing"] or 0),
+            "sent": int(row["sent"] or 0),
+            "failed": int(row["failed"] or 0),
+            "other": int(row["other"] or 0),
+        }
+
     @staticmethod
     def _default_campaign_id(conn) -> int:
         row = conn.execute(
@@ -241,7 +284,7 @@ class Database:
                         COUNT(t.id) AS task_count,
                         SUM(CASE WHEN t.status IN ('sent', 'replied')
                             THEN 1 ELSE 0 END) AS sent_count,
-                        SUM(CASE WHEN t.status IN ('new', 'needs_review')
+                        SUM(CASE WHEN t.status NOT IN ('sent', 'replied', 'failed', 'cancelled')
                             THEN 1 ELSE 0 END) AS pending_count,
                         SUM(CASE WHEN t.status = 'drafted'
                             THEN 1 ELSE 0 END) AS drafted_count,
@@ -488,7 +531,8 @@ class Database:
             rows = conn.execute(
                 """SELECT profile_no,
                     SUM(CASE WHEN status = 'drafted' THEN 1 ELSE 0 END) AS drafted,
-                    SUM(CASE WHEN status IN ('new','ready','needs_review') THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status NOT IN ('sent','replied','failed','cancelled')
+                        THEN 1 ELSE 0 END) AS pending,
                     SUM(CASE WHEN status IN ('sent','replied') THEN 1 ELSE 0 END) AS sent,
                     SUM(CASE WHEN last_error <> '' THEN 1 ELSE 0 END) AS failed
                 FROM tasks
@@ -535,7 +579,7 @@ class Database:
         with self.connect() as conn:
             return conn.execute(
                 "SELECT * FROM tasks WHERE profile_no IN (" + placeholders + ") "
-                "AND status IN ('new', 'ready') ORDER BY id",
+                "AND status IN ('pending', 'generated') ORDER BY id",
                 numbers,
             ).fetchall()
 
@@ -555,7 +599,9 @@ class Database:
             "name_override", "location_override", "sender_name_override",
             "subject", "body", "gender_label", "gender_source", "source_urls",
             "review_reason", "status", "custom_variables",
-            "campaign_id", "generated_at", "drafted_at", "sent_at", "replied_at",
+            "campaign_id", "generated_at", "fill_started_at", "drafted_at",
+            "send_clicked_at", "sent_at", "replied_at",
+            "last_failed_at", "failure_stage", "browser_type",
             "last_error", "attempts",
         }
         unknown = sorted(set(values) - allowed)
@@ -644,7 +690,7 @@ class Database:
         with self.connect() as conn:
             cur = conn.execute(
                 "UPDATE tasks SET status=CASE "
-                "WHEN drafted_at IS NULL THEN 'ready' ELSE 'drafted' END, "
+                "WHEN drafted_at IS NULL THEN 'generated' ELSE 'drafted' END, "
                 "sent_at=NULL, replied_at=NULL, "
                 f"last_error='' WHERE id IN ({placeholders}) "
                 "AND status IN ('sent', 'replied')",

@@ -119,7 +119,7 @@ class WorkflowTemplateBindingTests(unittest.TestCase):
         workflow = Workflow(db=database, settings=Settings())
         workflow.generate_local(1, threading.Event())
         self.assertEqual(database.values["sender_name_override"], "")
-        self.assertEqual(database.values["status"], "ready")
+        self.assertEqual(database.values["status"], "generated")
 
 
 class BalancedWindowAssignmentTests(unittest.TestCase):

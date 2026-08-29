@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..batch import group_tasks_by_window
 from ..config import (
     BATCH_DRAFT_INTERVAL_SECONDS,
     MAX_CONCURRENT_TASKS,
@@ -83,6 +85,9 @@ class MainWindow(QMainWindow):
         self.settings_store = QSettings("NiuMaMail", "Studio")
         self._busy = False
         self._licensed = bool(self.trial_status.active)
+        self._closing = False
+        self._window_locks: dict[int, threading.Lock] = {}
+        self._window_locks_guard = threading.Lock()
         self._campaigns: list[dict] = []
         self._campaign_search_text = ""
         self._command_palette: CommandPalette | None = None
@@ -260,8 +265,17 @@ class MainWindow(QMainWindow):
         self._update_license_label()
         enabled = self._licensed
         activity = self.pages[0]
-        activity.import_button.setEnabled(enabled)
-        activity.inspector.generate_button.setEnabled(enabled)
+        for button in (
+            activity.import_button,
+            activity.generate_button,
+            activity.open_draft_button,
+            getattr(activity, "add_contact_button", None),
+            activity.inspector.generate_button,
+            activity.inspector.auto_send_button,
+            activity.window_panel.auto_fill_button,
+        ):
+            if button is not None:
+                button.setEnabled(enabled)
 
     def require_license(self) -> bool:
         self.trial_status = check_trial()
@@ -279,9 +293,13 @@ class MainWindow(QMainWindow):
         self.refresh_campaigns()
         self.refresh_tasks()
         self.refresh_history()
+        self.refresh_stats()
         self.pages[2].reload()
         self.pages[4].load()
         self._update_license_label()
+
+    def refresh_stats(self) -> None:
+        self.pages[0].set_stats(self.db.stats())
 
     def refresh_campaigns(self) -> None:
         self._campaigns = self.db.list_campaigns()
@@ -315,8 +333,10 @@ class MainWindow(QMainWindow):
         draft_rows = [
             row
             for row in rows
-            if row["status"] in {"ready", "drafted", "needs_review"}
-            or row["last_error"]
+            if row["status"] in {
+                "generated", "filling", "drafted", "sending",
+                "failed", "needs_review",
+            }
         ]
         self.pages[0].set_draft_tasks(draft_rows)
         self._refresh_all_tasks()
@@ -333,13 +353,14 @@ class MainWindow(QMainWindow):
                 for row in rows
                 if keyword
                 in " ".join(
-                    str(
-                        row.get("name_override")
-                        or row.get("first_name")
-                        or row.get("recipient_email")
-                        or row.get("location")
-                        or ""
-                    )
+                    [
+                        str(row.get("name_override") or ""),
+                        str(row.get("first_name") or ""),
+                        str(row.get("last_name") or ""),
+                        str(row.get("location_override") or ""),
+                        str(row.get("location") or ""),
+                        str(row.get("recipient_email") or ""),
+                    ]
                 ).lower()
             ]
         self.pages[1].set_tasks(rows)
@@ -365,12 +386,12 @@ class MainWindow(QMainWindow):
                 for row in rows
                 if keyword
                 in " ".join(
-                    str(
-                        row.get("recipient_email")
-                        or row.get("name_override")
-                        or row.get("first_name")
-                        or ""
-                    )
+                    [
+                        str(row.get("recipient_email") or ""),
+                        str(row.get("name_override") or ""),
+                        str(row.get("first_name") or ""),
+                        str(row.get("last_name") or ""),
+                    ]
                 ).lower()
             ]
         page.set_rows(rows)
@@ -426,24 +447,34 @@ class MainWindow(QMainWindow):
             return
         task_count = int(campaign.get("task_count") or 0)
         if task_count:
-            answer = QMessageBox.question(
-                self,
-                tr("删除活动/批次"),
-                tr("“{name}”中有 {count} 条联系人。是否移到默认批次？")
-                .format(name=campaign["name"], count=task_count),
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
+            box = QMessageBox(self)
+            box.setWindowTitle(tr("删除活动/批次"))
+            box.setIcon(QMessageBox.Warning)
+            box.setText(
+                tr("“{name}”中有 {count} 条联系人。\n"
+                   "请选择处理方式：").format(
+                    name=campaign["name"], count=task_count
+                )
             )
-            if answer == QMessageBox.Cancel:
+            move_button = box.addButton(
+                tr("移动联系人后删除"), QMessageBox.AcceptRole
+            )
+            delete_button = box.addButton(
+                tr("连同联系人永久删除"), QMessageBox.DestructiveRole
+            )
+            cancel_button = box.addButton(tr("取消"), QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_button:
                 return
-            if answer == QMessageBox.Yes:
+            if clicked is move_button:
                 default = next(
                     (item for item in self._campaigns if item["name"] == "默认批次"),
                     None,
                 )
                 move_to = int(default["id"]) if default is not None else None
                 self.db.delete_campaign(int(campaign["id"]), move_to=move_to)
-            else:
+            elif clicked is delete_button:
                 self.db.delete_campaign(int(campaign["id"]))
         else:
             self.db.delete_campaign(int(campaign["id"]))
@@ -549,6 +580,8 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- operations
     def run_async(self, fn, on_done=None, on_error=None, *args, **kwargs) -> None:
+        if self._closing:
+            return
         cancel_event, serial = self.operations.begin()
         self.set_busy(True)
         signals = WorkerSignals()
@@ -598,6 +631,20 @@ class MainWindow(QMainWindow):
             ids = self.pages[1].selected_task_ids()
         return list(dict.fromkeys(ids))
 
+    def _cap_task_ids(self, task_ids: list[int]) -> list[int]:
+        unique = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+        if len(unique) > MAX_CONCURRENT_TASKS:
+            self.set_status(
+                tr("一次最多执行 {limit} 条，已截取前 {limit} 条")
+                .format(limit=MAX_CONCURRENT_TASKS)
+            )
+            return unique[:MAX_CONCURRENT_TASKS]
+        return unique
+
+    def _window_lock(self, profile: int) -> threading.Lock:
+        with self._window_locks_guard:
+            return self._window_locks.setdefault(int(profile), threading.Lock())
+
     def generate_selected(self) -> None:
         if not self.require_license():
             return
@@ -605,6 +652,7 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择要生成的联系人。"))
             return
+        ids = self._cap_task_ids(ids)
         self.generate_tasks(ids)
 
     def load_demo_data(self) -> None:
@@ -667,6 +715,7 @@ class MainWindow(QMainWindow):
         ids = [int(task_id) for task_id in task_ids]
         if not ids:
             return
+        ids = self._cap_task_ids(ids)
         def run(cancel_event, progress, task_ids):
             return self._run_tasks_parallel(
                 cancel_event,
@@ -735,20 +784,116 @@ class MainWindow(QMainWindow):
             raise RuntimeError(tr("部分任务失败：") + "；".join(errors[:5]))
         return total
 
-    def open_selected_drafts(self, wait_send: bool = False) -> None:
+    def _run_window_parallel(
+        self,
+        cancel_event,
+        progress,
+        task_ids: list[int],
+        worker,
+    ) -> int:
+        """Different windows run concurrently; one window processes serially."""
+        rows = self.db.get_tasks(task_ids)
+        by_window, unassigned = group_tasks_by_window(rows)
+        if unassigned:
+            raise RuntimeError(
+                tr("部分任务未绑定浏览器窗口，已取消执行：")
+                + ",".join(str(task_id) for task_id in unassigned[:8])
+            )
+        groups = list(by_window.items())
+        if not groups:
+            return 0
+        max_workers = min(MAX_CONCURRENT_TASKS, len(groups))
+        errors: list[str] = []
+        completed = 0
+        lock = threading.Lock()
+        total = len(task_ids)
+
+        def run_window(ce, pr, profile, group):
+            nonlocal completed
+            with self._window_lock(profile):
+                for index, task_id in enumerate(group):
+                    check_cancel(ce)
+                    if index:
+                        deadline = time.monotonic() + BATCH_DRAFT_INTERVAL_SECONDS
+                        while time.monotonic() < deadline:
+                            check_cancel(ce)
+                            time.sleep(0.2)
+                    try:
+                        worker(ce, pr, task_id)
+                    except OperationCancelledError:
+                        raise
+                    except Exception as exc:
+                        errors.append(str(exc))
+                    with lock:
+                        completed += 1
+                        current = completed
+                    pr(
+                        current,
+                        tr("已完成 {completed}/{total}").format(
+                            completed=current, total=total
+                        ),
+                    )
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="niuma-window",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    run_window, cancel_event, progress, profile, group
+                )
+                for profile, group in groups
+            ]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except OperationCancelledError:
+                for pending in futures:
+                    pending.cancel()
+                raise
+        if errors:
+            raise RuntimeError(tr("部分任务失败：") + "；".join(errors[:5]))
+        return completed
+
+    def open_selected_drafts(
+        self, wait_send: bool = False, forced_ids: list[int] | None = None
+    ) -> None:
         if not self.require_license():
             return
-        ids = self._selected_ids()
+        ids = list(forced_ids) if forced_ids else self._selected_ids()
         if not ids:
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择要填写草稿的联系人。"))
             return
+        ids = self._cap_task_ids(ids)
+        if wait_send and self.settings.auto_send_confirm:
+            rows = self.db.get_tasks(ids)
+            windows = sorted(
+                {
+                    int(row["profile_no"])
+                    for row in rows
+                    if int(row.get("profile_no") or 0) > 0
+                }
+            )
+            window_text = ", ".join(map(str, windows)) or tr("未绑定")
+            answer = QMessageBox.question(
+                self,
+                tr("自动发送确认"),
+                tr("将自动发送 {count} 封邮件。\n"
+                   "浏览器窗口：{windows}\n\n"
+                   "发送前会重新校验 Gmail 中的收件人、主题与正文，确认后开始？")
+                .format(count=len(ids), windows=window_text),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
 
         def run(cancel_event, progress, task_ids, waiting):
             workflow = self.workflow
 
             def worker(ce, pr, task_id):
                 if waiting:
-                    return workflow.open_draft_wait_send(
+                    return workflow.open_and_send(
                         task_id,
                         progress=lambda value, text: pr(0, text),
                         cancel_event=ce,
@@ -759,23 +904,47 @@ class MainWindow(QMainWindow):
                     cancel_event=ce,
                 )
 
+            if waiting:
+                return self._run_window_parallel(
+                    cancel_event, progress, task_ids, worker
+                )
             return self._run_tasks_parallel(
                 cancel_event, progress, task_ids, worker
             )
 
         def done(count):
-            self.set_status(tr("已填写 {count} 封 Gmail 草稿").format(count=count))
+            if wait_send:
+                self.set_status(tr("已自动发送 {count} 封邮件").format(count=count))
+            else:
+                self.set_status(tr("已填写 {count} 封 Gmail 草稿").format(count=count))
 
         self.run_async(run, on_done=done, task_ids=ids, waiting=wait_send)
+
+    def send_single_task(self, task_id: int) -> None:
+        self.open_selected_drafts(wait_send=True, forced_ids=[int(task_id)])
 
     def mark_selected_sent(self) -> None:
         ids = self._selected_ids()
         if not ids:
             QMessageBox.information(self, tr("未选择联系人"), tr("请先选择已发送的邮件。"))
             return
-        self.db.mark_sent(ids)
+        rows = self.db.get_tasks(ids)
+        allowed = [
+            int(row["id"])
+            for row in rows
+            if row["status"] in {"drafted", "sending", "failed"}
+            or row.get("drafted_at") or row.get("send_clicked_at")
+        ]
+        if not allowed:
+            QMessageBox.warning(
+                self,
+                tr("不能标记"),
+                tr("所选任务尚未生成并填写草稿，不能标记为已发送。"),
+            )
+            return
+        self.db.mark_sent(allowed)
         self.refresh_all()
-        self.set_status(tr("已标记 {count} 封邮件为已发送").format(count=len(ids)))
+        self.set_status(tr("已标记 {count} 封邮件为已发送").format(count=len(allowed)))
 
     def unmark_selected(self) -> None:
         ids = self._selected_ids()
@@ -830,8 +999,22 @@ class MainWindow(QMainWindow):
     def retry_failed_drafts(self) -> None:
         if not self.require_license():
             return
-        rows = self.db.list_tasks()
-        ids = [int(row["id"]) for row in rows if row["last_error"] and row["status"] not in {"sent", "replied"}]
+        selected = self.pages[0].draft_task_ids()
+        if selected:
+            ids = selected
+        else:
+            campaign_id = self.pages[0].current_campaign_id()
+            rows = (
+                self.db.tasks_by_campaign(campaign_id)
+                if campaign_id is not None
+                else self.db.list_tasks()
+            )
+            ids = [
+                int(row["id"])
+                for row in rows
+                if row["status"] == "failed"
+            ]
+        ids = self._cap_task_ids(ids)
         if not ids:
             QMessageBox.information(self, tr("没有失败任务"), tr("当前没有可重试的失败任务。"))
             return
@@ -841,13 +1024,13 @@ class MainWindow(QMainWindow):
 
             def worker(ce, pr, task_id):
                 workflow.generate_local(task_id, cancel_event=ce)
-                return workflow.open_draft(
+                return workflow.open_and_send(
                     task_id,
                     progress=lambda value, text: pr(0, text),
                     cancel_event=ce,
                 )
 
-            return self._run_tasks_parallel(
+            return self._run_window_parallel(
                 cancel_event, progress, task_ids, worker
             )
 
@@ -1005,6 +1188,25 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        try:
+            with open(path, "rb") as handle:
+                header = handle.read(16)
+        except OSError as exc:
+            self.show_error(tr("恢复失败"), str(exc))
+            return
+        if not header.startswith(b"SQLite format 3"):
+            self.show_error(tr("恢复失败"), tr("备份文件不是有效的数据库。"))
+            return
+        self.db.backup()
+        answer = QMessageBox.question(
+            self,
+            tr("恢复数据库"),
+            tr("恢复将覆盖当前全部数据（已自动备份当前数据库）。确定继续？"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         if self.db.restore_backup(path):
             self.refresh_all()
             self.set_status(tr("数据库已恢复"))
@@ -1100,7 +1302,7 @@ class MainWindow(QMainWindow):
             (tr("新增联系人"), "", self.add_contact),
             (tr("生成所选邮件预览"), tr("Ctrl+Enter"), self.generate_selected),
             (tr("打开 Gmail 草稿"), tr("Ctrl+D"), lambda: self.open_selected_drafts(False)),
-            (tr("打开并等待发送"), "", lambda: self.open_selected_drafts(True)),
+            (tr("填写并自动发送"), "", lambda: self.open_selected_drafts(True)),
             (tr("标记所选为已发送"), "", self.mark_selected_sent),
             (tr("撤销已发送标记"), "", self.unmark_selected),
             (tr("重试失败草稿"), "", self.retry_failed_drafts),
@@ -1123,10 +1325,23 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, event) -> None:
+        self._closing = True
         cancel_event, serial = self.operations.begin()
-        self.operations.finish(cancel_event, serial)
         self.thread_pool.clear()
-        self.thread_pool.waitForDone(1500)
+        if not self.thread_pool.waitForDone(30_000):
+            answer = QMessageBox.question(
+                self,
+                tr("任务仍在运行"),
+                tr("仍有后台任务未结束（例如正在等待 Gmail 发送结果）。"
+                   "确定立即退出？"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self._closing = False
+                event.ignore()
+                return
+        self.operations.finish(cancel_event, serial)
         self.settings_store.setValue("geometry", self.saveGeometry())
         campaign_id = self.pages[0].current_campaign_id()
         if campaign_id is not None:

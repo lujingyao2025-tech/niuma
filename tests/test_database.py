@@ -62,10 +62,10 @@ class DatabaseUpdateTests(unittest.TestCase):
         self.assertIsNotNone(task["replied_at"])
 
     def test_unmark_returns_to_real_previous_stage(self) -> None:
-        self.db.update_task(self.task_id, status="ready")
+        self.db.update_task(self.task_id, status="generated")
         self.db.mark_sent([self.task_id])
         self.db.unmark_sent([self.task_id])
-        self.assertEqual(self.db.get_task(self.task_id)["status"], "ready")
+        self.assertEqual(self.db.get_task(self.task_id)["status"], "generated")
 
         self.db.update_task(
             self.task_id,

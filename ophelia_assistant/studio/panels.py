@@ -49,12 +49,16 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         row = index.data(Qt.UserRole)
         status = str(row.get("status") or "new") if isinstance(row, dict) else "new"
         mapping = {
-            "new": (self.p.muted, self.p.hover),
-            "ready": (self.p.warn, self.p.warn_soft),
-            "needs_review": (self.p.danger, self.p.danger_soft),
+            "pending": (self.p.muted, self.p.hover),
+            "generated": (self.p.info, self.p.info_soft),
+            "filling": (self.p.accent, self.p.accent_soft),
             "drafted": (self.p.info, self.p.info_soft),
+            "sending": (self.p.accent, self.p.accent_soft),
             "sent": (self.p.ok, self.p.ok_soft),
             "replied": (self.p.ok, self.p.ok_soft),
+            "failed": (self.p.danger, self.p.danger_soft),
+            "cancelled": (self.p.faint, self.p.hover),
+            "needs_review": (self.p.danger, self.p.danger_soft),
         }
         text_color, soft_color = mapping.get(status, (self.p.muted, self.p.hover))
         label = status_text(status)
@@ -175,6 +179,33 @@ class PageHeader(QWidget):
 
     def set_subtitle(self, subtitle: str) -> None:
         self.subtitle.setText(subtitle)
+
+
+class StatsBar(QWidget):
+    """Compact one-line task statistics; not a card wall."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel("")
+        self.label.setObjectName("countText")
+        layout.addWidget(self.label)
+        layout.addStretch(1)
+
+    def set_stats(self, stats: dict[str, int]) -> None:
+        self.label.setText(
+            tr("总 {total} · 待处理 {pending} · 已生成 {generated} "
+               "· 处理中 {processing} · 成功 {sent} · 失败 {failed}")
+            .format(
+                total=stats.get("total", 0),
+                pending=stats.get("pending", 0),
+                generated=stats.get("generated", 0),
+                processing=stats.get("processing", 0),
+                sent=stats.get("sent", 0),
+                failed=stats.get("failed", 0),
+            )
+        )
 
 
 class TaskTablePanel(QWidget):
@@ -703,10 +734,14 @@ class TaskInspector(QWidget):
         self.generate_button = QPushButton(tr("生成预览"))
         self.generate_button.setProperty("class", "primary")
         self.generate_button.clicked.connect(self.generate)
+        self.auto_send_button = QPushButton(tr("填写并自动发送"))
+        self.auto_send_button.setProperty("class", "primary")
+        self.auto_send_button.clicked.connect(self.auto_send)
         preview_actions.addWidget(copy_subject)
         preview_actions.addWidget(copy_body)
         preview_actions.addStretch(1)
         preview_actions.addWidget(self.generate_button)
+        preview_actions.addWidget(self.auto_send_button)
         preview_layout.addLayout(preview_actions)
         self.tabs.addTab(self.preview_tab, tr("邮件预览"))
 
@@ -756,6 +791,7 @@ class TaskInspector(QWidget):
         self.subject_label.setText(str(row.get("subject") or tr("尚未生成主题")))
         self.preview_browser.setPlainText(str(row.get("body") or tr("尚未生成正文，请先点击“生成预览”。")))
         self.generate_button.setEnabled(True)
+        self.auto_send_button.setEnabled(True)
 
     def clear(self) -> None:
         self.current_row = None
@@ -767,6 +803,7 @@ class TaskInspector(QWidget):
         self.subject_label.setText(tr("尚未生成主题"))
         self.preview_browser.clear()
         self.generate_button.setEnabled(False)
+        self.auto_send_button.setEnabled(False)
 
     def save_profile(self) -> None:
         if self.current_row is None or not self.current_row.get("id"):
@@ -808,6 +845,11 @@ class TaskInspector(QWidget):
         if self.current_row is None or not self.current_row.get("id"):
             return
         self.window.generate_tasks([int(self.current_row["id"])])
+
+    def auto_send(self) -> None:
+        if self.current_row is None or not self.current_row.get("id"):
+            return
+        self.window.send_single_task(int(self.current_row["id"]))
 
     def set_operation_busy(self, busy: bool) -> None:
         self.cancel_button.setEnabled(busy)

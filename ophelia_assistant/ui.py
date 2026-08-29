@@ -55,10 +55,16 @@ logger = logging.getLogger("niuma-mail")
 STATUS_LABELS = {
     "new": "新任务",
     "ready": "待确认",
+    "pending": "待处理",
+    "generated": "已生成",
+    "filling": "正在填写",
     "needs_review": "需要手动修改",
     "drafted": "Gmail 草稿",
+    "sending": "正在发送",
     "sent": "历史：已发送",
     "replied": "历史：已回复",
+    "failed": "发送失败",
+    "cancelled": "已取消",
 }
 SYSTEM_VARIABLES = (
     ("first_name", "联系人称呼（完整姓名时使用姓氏）"),
@@ -400,10 +406,12 @@ class App(tk.Tk):
         if not active:
             return
         ungenerated = sum(
-            1 for row in active if row["status"] in {"new", "needs_review"}
+            1 for row in active if row["status"] in {"pending", "new", "needs_review"}
         )
         drafted = sum(1 for row in active if row["status"] == "drafted")
-        ready = sum(1 for row in active if row["status"] == "ready")
+        ready = sum(
+            1 for row in active if row["status"] in {"generated", "ready"}
+        )
         if not messagebox.askyesno(
             "继续上次任务",
             f"检测到 {len(active)} 条未完成任务：\n"
@@ -926,7 +934,7 @@ class App(tk.Tk):
         self.generate_selected_button.pack(side="left", padx=(0, 6))
         self.open_drafts_button = ttk.Button(actions, text=tr("2  填写 Gmail 草稿"), style="Primary.TButton", command=lambda: self.open_selected_drafts(False))
         self.open_drafts_button.pack(side="left", padx=(0, 6))
-        self.wait_send_button = ttk.Button(actions, text=tr("填写并等待发送"), style="Primary.TButton", command=lambda: self.open_selected_drafts(True))
+        self.wait_send_button = ttk.Button(actions, text=tr("填写并自动发送"), style="Primary.TButton", command=lambda: self.open_selected_drafts(True))
         self.wait_send_button.pack(side="left", padx=(0, 6))
         self.cancel_operation_button = ttk.Button(actions, text=tr("停止当前任务"), style="Soft.TButton", command=self.cancel_current_operation)
         self.cancel_operation_button.pack(side="left")
@@ -3367,7 +3375,7 @@ class App(tk.Tk):
             profile_failures: dict[int, int] = {}
             started_at = time.monotonic()
             mode = "优先按任务表编号，空缺使用窗口顺序" if sequence_used else "按任务表已填编号"
-            action_text = "填写并等待发送" if wait_send else "填写"
+            action_text = "填写并自动发送" if wait_send else "填写"
             self.after(0, lambda: self._set_status(
                 f"正在{mode}{action_text} {runnable_count} 封邮件，"
                 f"预计等待约 {self._format_eta(estimate_seconds)}",
@@ -3527,7 +3535,7 @@ class App(tk.Tk):
         task_ids = [
             int(row["id"])
             for row in rows
-            if row["status"] in {"new", "needs_review"}
+            if row["status"] in {"pending", "new", "needs_review"}
         ]
         if not task_ids:
             self._set_status("当前没有未生成的任务")
@@ -4219,7 +4227,8 @@ class App(tk.Tk):
                     continue
             elif self.task_filter != "all" and not (
                 status == self.task_filter
-                or self.task_filter == "new" and status == "needs_review"
+                or self.task_filter == "new"
+                and status in {"pending", "new", "needs_review"}
             ):
                 continue
             values = self._task_row_values(row)
@@ -4269,11 +4278,17 @@ class App(tk.Tk):
         self._render_task_rows(rows)
         counts = Counter(row["status"] for row in rows)
         self.stat_vars["all"].set(str(len(rows)))
-        self.stat_vars["new"].set(str(counts["new"] + counts["needs_review"]))
-        self.stat_vars["ready"].set(str(counts["ready"]))
+        self.stat_vars["new"].set(
+            str(counts["pending"] + counts["new"] + counts["needs_review"])
+        )
+        self.stat_vars["ready"].set(
+            str(counts["generated"] + counts["ready"])
+        )
         self.stat_vars["drafted"].set(str(counts["drafted"]))
         if hasattr(self, "ungenerated_hint_var"):
-            ungenerated = counts["new"] + counts["needs_review"]
+            ungenerated = (
+                counts["pending"] + counts["new"] + counts["needs_review"]
+            )
             self.ungenerated_hint_var.set(
                 f"有 {ungenerated} 条任务未生成邮件内容" if ungenerated else ""
             )
