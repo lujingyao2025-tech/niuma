@@ -720,17 +720,16 @@ class Workflow:
                 self._mark_cancelled(task_id)
                 raise
             except Exception as exc:
-                self._record_failure(
+                # Old toasts are allowed to linger: the result wait uses stable
+                # alert node ids, so a lingering same-text toast cannot be
+                # mistaken for a new send confirmation.
+                trace_execution(
                     task_id,
-                    exc,
-                    "stale_toast",
-                    timer=timer,
-                    verify_result=verify_result,
+                    "stale_toast_soft",
+                    "旧发送提示未消失，继续发送并改用新提示节点判定",
+                    profile_no=task["profile_no"],
+                    extra={"detail": str(exc)},
                 )
-                save_failure_screenshot(
-                    browser, task_id, task["profile_no"], "stale_toast"
-                )
-                raise
             self.db.update_task(
                 task_id,
                 status="sending",
@@ -784,7 +783,11 @@ class Workflow:
             )
             # In-flight sends must finish: do not cancel while waiting.
             try:
-                wait_for_gmail_send(browser, timer=timer)
+                wait_for_gmail_send(
+                    browser,
+                    timer=timer,
+                    baseline=baseline,
+                )
             except BrowserAutomationError as exc:
                 stage = (
                     "wait_send"

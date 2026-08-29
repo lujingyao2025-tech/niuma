@@ -1022,29 +1022,27 @@ def wait_for_gmail_send(
     baseline: tuple[str, ...] | None = None,
     timer: StageTimer | None = None,
 ) -> None:
-    """Wait until Gmail shows a NEW send toast; old toasts must be cleared first."""
+    """Wait for a NEW send toast node; same-text old toasts are ignored."""
     if timer is not None:
         timer.next("wait_send")
     page = _compose_page(browser) or _gmail_page(browser)
+    baseline_ids = {
+        str(marker)
+        for marker in (baseline or ())
+        if str(marker).startswith("node:")
+    }
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
         try:
-            page.locator('[role="alert"]').last.wait_for(
-                state="visible",
-                timeout=min(
-                    2000,
-                    max(0, int((deadline - time.monotonic()) * 1000)),
-                ),
-            )
+            nodes = _alert_nodes(page)
         except (PlaywrightTimeoutError, PlaywrightError):
-            pass
-        try:
-            alerts = page.locator('[role="alert"]').all_inner_texts()
-        except PlaywrightError:
-            alerts = []
-        for alert in alerts:
-            alert_text = str(alert)
+            nodes = []
+        for node in nodes:
+            node_id = str(node.get("id") or "")
+            if baseline_ids and node_id in baseline_ids:
+                continue
+            alert_text = str(node.get("text") or "")
             if FAILURE_PROMPT_RE.search(alert_text):
                 raise BrowserAutomationError(
                     f"Gmail 提示发送失败：{alert_text[:200]}"
@@ -1061,35 +1059,80 @@ def wait_for_gmail_send(
     )
 
 
-def gmail_alert_baseline(browser: Browser) -> tuple[str, ...]:
-    """Capture current role=alert texts before clicking Send."""
-    page = _compose_page(browser) or _gmail_page(browser)
+def _alert_nodes(page: Page) -> list[dict[str, str]]:
+    """Return visible role=alert nodes with stable ids and inner text."""
     try:
-        return tuple(page.locator('[role="alert"]').all_inner_texts())
+        raw = page.locator('[role="alert"]').evaluate_all(
+            """els => els.filter((el) => {
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            }).map((el) => {
+                if (!el.__niumaAlertId) {
+                    el.__niumaAlertId = 'node:' +
+                        Math.random().toString(36).slice(2) +
+                        Date.now().toString(36);
+                }
+                return {id: el.__niumaAlertId, text: el.innerText || ''};
+            })"""
+        )
+        return [
+            {"id": str(item.get("id") or ""), "text": str(item.get("text") or "")}
+            for item in raw
+            if isinstance(item, dict)
+        ]
     except PlaywrightError:
-        return ()
+        return []
+
+
+def gmail_alert_baseline(browser: Browser) -> tuple[str, ...]:
+    """Capture current visible role=alert node ids before clicking Send."""
+    page = _compose_page(browser) or _gmail_page(browser)
+    return tuple(sorted(node["id"] for node in _alert_nodes(page) if node["id"]))
 
 
 def wait_for_gmail_alerts_clear(
     browser: Browser,
     baseline: tuple[str, ...] | None = None,
-    timeout_ms: int = 8000,
+    timeout_ms: int = 15000,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Wait until pre-click toasts are gone so a same-text new toast is trusted."""
+    """Wait for pre-click send toasts to clear; unrelated alerts never block."""
     page = _compose_page(browser) or _gmail_page(browser)
-    baseline_set = {str(text) for text in (baseline or ())}
+    baseline_ids = {
+        str(marker)
+        for marker in (baseline or ())
+        if str(marker).startswith("node:")
+    }
+    baseline_texts = {
+        str(text)
+        for text in (baseline or ())
+        if not str(text).startswith("node:")
+    }
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         check_cancel(cancel_event)
-        try:
-            current = [
-                str(alert)
-                for alert in page.locator('[role="alert"]').all_inner_texts()
+        if baseline_ids:
+            current_ids = {node["id"] for node in _alert_nodes(page)}
+            if not (baseline_ids & current_ids):
+                return
+        if baseline_texts:
+            try:
+                current = [
+                    str(alert)
+                    for alert in page.locator('[role="alert"]').all_inner_texts()
+                ]
+            except PlaywrightError:
+                current = []
+            send_texts = [
+                text
+                for text in current
+                if SUCCESS_PROMPT_RE.search(text) or FAILURE_PROMPT_RE.search(text)
             ]
-        except PlaywrightError:
-            current = []
-        if not baseline_set or not any(text in baseline_set for text in current):
+            if not any(text in baseline_texts for text in send_texts):
+                return
+        if not baseline_ids and not baseline_texts:
             return
         time.sleep(0.1)
     raise BrowserAutomationError(

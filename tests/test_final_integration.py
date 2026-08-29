@@ -601,7 +601,10 @@ class ToastDedupeTests(unittest.TestCase):
             self.holder = holder
 
         def all_inner_texts(self):
-            return list(self.holder["texts"])
+            return list(self.holder.get("texts", []))
+
+        def evaluate_all(self, _expression):
+            return [dict(node) for node in self.holder.get("nodes", [])]
 
     class FakePage:
         def __init__(self, holder):
@@ -648,6 +651,53 @@ class ToastDedupeTests(unittest.TestCase):
                 browser_module.wait_for_gmail_alerts_clear(
                     mock.Mock(), baseline=("Message sent",), timeout_ms=200
                 )
+
+    def test_unrelated_alert_does_not_block_send(self) -> None:
+        from ophelia_assistant import browser as browser_module
+
+        holder = {"texts": ["Connection lost. Retrying."]}
+        page = self.FakePage(holder)
+        with mock.patch.object(
+            browser_module, "_compose_page", return_value=page
+        ):
+            browser_module.wait_for_gmail_alerts_clear(
+                mock.Mock(),
+                baseline=("Connection lost. Retrying.",),
+                timeout_ms=500,
+            )
+
+    def test_new_same_text_toast_node_accepted_with_old_node_lingering(
+        self,
+    ) -> None:
+        import threading
+        import time
+
+        from ophelia_assistant import browser as browser_module
+
+        holder = {
+            "nodes": [
+                {"id": "node:old", "text": "Message sent"},
+            ]
+        }
+        page = self.FakePage(holder)
+        with mock.patch.object(
+            browser_module, "_compose_page", return_value=page
+        ):
+            def show_new():
+                time.sleep(0.2)
+                holder["nodes"] = [
+                    {"id": "node:old", "text": "Message sent"},
+                    {"id": "node:new", "text": "Message sent"},
+                ]
+
+            thread = threading.Thread(target=show_new)
+            thread.start()
+            browser_module.wait_for_gmail_send(
+                mock.Mock(),
+                baseline=("node:old",),
+                timeout_ms=3000,
+            )
+            thread.join()
 
 
 class SendBlockerTests(unittest.TestCase):
