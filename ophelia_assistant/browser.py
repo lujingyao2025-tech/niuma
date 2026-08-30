@@ -238,51 +238,34 @@ def _replace_compose_body(
     body: str,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Focus Gmail's contenteditable body and type like a real keyboard.
-
-    Recent Gmail layouts expose the body as contenteditable but can keep it in
-    a transient state where Playwright's Locator.fill() waits until timeout.
-    Keyboard input after DOM focus works with both English and Chinese layouts.
-    """
+    """Fill Gmail's contenteditable body fast, with bounded fallbacks."""
     check_cancel(cancel_event)
     marker = next((line.strip() for line in body.splitlines() if line.strip()), body.strip())
-    try:
-        body_box.evaluate("element => element.focus()")
-    except PlaywrightError as exc:
-        raise BrowserAutomationError("正文输入区已找到，但无法获得输入焦点") from exc
-    page.keyboard.press("Control+A")
-    page.keyboard.press("Backspace")
-    page.keyboard.insert_text(body)
-    check_cancel(cancel_event)
 
-    # Read through DOM evaluation instead of Locator.inner_text(). Gmail may
-    # visually accept all text while inner_text still waits for actionability
-    # and eventually reports a false timeout.
-    current_text = ""
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        check_cancel(cancel_event)
-        try:
-            current_text = body_box.evaluate(
-                "element => element.innerText || element.textContent || ''"
-            )
-        except PlaywrightError:
-            current_text = ""
-        if marker and marker in str(current_text):
-            break
-        page.wait_for_timeout(100)
-    check_cancel(cancel_event)
+    # Fast path: Playwright's fill() handles contenteditable directly. A short
+    # timeout keeps Gmail actionability stalls from turning into long freezes.
     try:
-        current_text = body_box.evaluate(
-            "element => element.innerText || element.textContent || ''"
-        )
-    except PlaywrightError:
-        current_text = ""
-    if marker and marker in str(current_text):
+        body_box.fill(body, timeout=2000)
+    except (PlaywrightTimeoutError, PlaywrightError):
+        pass
+    if _body_contains_marker(body_box, marker):
         return
 
-    # Fallback for layouts that ignore synthetic keyboard input until an edit
-    # command is issued. This still edits the draft only and never sends it.
+    # Keyboard path for layouts that need a real focus/edit command first.
+    try:
+        body_box.evaluate("element => element.focus()", timeout=2000)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.insert_text(body)
+    except (PlaywrightTimeoutError, PlaywrightError) as exc:
+        raise BrowserAutomationError(
+            "正文输入区已找到，但无法写入内容"
+        ) from exc
+    check_cancel(cancel_event)
+    if _body_contains_marker(body_box, marker):
+        return
+
+    # Last-resort DOM command for layouts that ignore synthetic keyboard input.
     try:
         body_box.evaluate(
             """(element, value) => {
@@ -295,26 +278,29 @@ def _replace_compose_body(
                 return document.execCommand('insertText', false, value);
             }""",
             body,
+            timeout=2000,
         )
-        deadline = time.monotonic() + 2
-        current_text = ""
-        while time.monotonic() < deadline:
-            check_cancel(cancel_event)
-            try:
-                current_text = body_box.evaluate(
-                    "element => element.innerText || element.textContent || ''"
-                )
-            except PlaywrightError:
-                current_text = ""
-            if marker and marker in str(current_text):
-                break
-            page.wait_for_timeout(100)
-    except PlaywrightError:
-        # The first keyboard strategy already completed; a DOM replacement
-        # during secondary verification must not turn success into an error.
+    except (PlaywrightTimeoutError, PlaywrightError):
         return
-    if not marker or marker not in str(current_text):
+    if not _body_contains_marker(body_box, marker):
         raise BrowserAutomationError("正文输入区已找到，但写入后未检测到邮件内容")
+
+
+def _body_contains_marker(body_box: Locator, marker: str) -> bool:
+    """Read body text once with a bounded timeout instead of a 30s default."""
+    if not marker:
+        return True
+    try:
+        current_text = str(
+            body_box.evaluate(
+                "element => element.innerText || element.textContent || ''",
+                timeout=2000,
+            )
+            or ""
+        )
+    except (PlaywrightTimeoutError, PlaywrightError):
+        return False
+    return marker in current_text
 
 
 def _input_has_value(control: Locator, expected: str) -> bool:

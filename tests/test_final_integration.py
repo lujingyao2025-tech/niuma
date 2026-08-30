@@ -700,6 +700,75 @@ class ToastDedupeTests(unittest.TestCase):
             thread.join()
 
 
+class ComposeBodyFillTests(unittest.TestCase):
+    class _FakeBody:
+        def __init__(self, holder):
+            self.holder = holder
+
+        def fill(self, value, timeout=None):
+            if self.holder.get("fill_raises"):
+                from playwright.sync_api import (
+                    TimeoutError as PlaywrightTimeoutError,
+                )
+
+                raise PlaywrightTimeoutError("actionability stall")
+            self.holder["text"] = value
+
+        def evaluate(self, expression, arg=None, timeout=None):
+            if "execCommand" in expression:
+                self.holder["text"] = arg or ""
+                return True
+            if "innerText" in expression or "textContent" in expression:
+                return self.holder.get("text", "")
+            return None
+
+    class _FakeKeyboard:
+        def __init__(self, holder):
+            self.holder = holder
+
+        def press(self, key):
+            self.holder.setdefault("keys", []).append(key)
+
+        def insert_text(self, value):
+            self.holder["text"] = value
+
+    class _FakePage:
+        def __init__(self, holder):
+            self.holder = holder
+            self.keyboard = ComposeBodyFillTests._FakeKeyboard(holder)
+
+    def test_body_fill_uses_fast_fill_path(self) -> None:
+        from ophelia_assistant import browser as browser_module
+
+        holder = {"text": "", "fill_raises": False}
+        page = self._FakePage(holder)
+        body = self._FakeBody(holder)
+        browser_module._replace_compose_body(
+            page,
+            body,
+            "Hello\nWorld",
+            None,
+        )
+        self.assertEqual(holder["text"], "Hello\nWorld")
+        self.assertEqual(holder.get("keys", []), [])
+
+    def test_body_fill_falls_back_to_keyboard_with_bounded_timeout(self) -> None:
+        from ophelia_assistant import browser as browser_module
+
+        holder = {"text": "", "fill_raises": True}
+        page = self._FakePage(holder)
+        body = self._FakeBody(holder)
+        browser_module._replace_compose_body(
+            page,
+            body,
+            "Hello\nWorld",
+            None,
+        )
+        self.assertEqual(holder["text"], "Hello\nWorld")
+        self.assertIn("Control+A", holder["keys"])
+        self.assertIn("Backspace", holder["keys"])
+
+
 class SendBlockerTests(unittest.TestCase):
     def test_send_clicked_blocks_automatic_retry(self) -> None:
         workflow = Workflow(db=None, settings=Settings())
