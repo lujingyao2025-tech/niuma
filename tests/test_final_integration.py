@@ -745,6 +745,7 @@ class ComposeBodyFillTests(unittest.TestCase):
         body = self._FakeBody(holder)
         browser_module._replace_compose_body(
             page,
+            mock.Mock(),
             body,
             "Hello\nWorld",
             None,
@@ -758,12 +759,18 @@ class ComposeBodyFillTests(unittest.TestCase):
         holder = {"text": "", "fill_raises": True}
         page = self._FakePage(holder)
         body = self._FakeBody(holder)
-        browser_module._replace_compose_body(
-            page,
-            body,
-            "Hello\nWorld",
-            None,
-        )
+        with mock.patch.object(
+            browser_module,
+            "_visible_largest",
+            return_value=body,
+        ):
+            browser_module._replace_compose_body(
+                page,
+                mock.Mock(),
+                body,
+                "Hello\nWorld",
+                None,
+            )
         self.assertEqual(holder["text"], "Hello\nWorld")
         self.assertIn("Control+A", holder["keys"])
         self.assertIn("Backspace", holder["keys"])

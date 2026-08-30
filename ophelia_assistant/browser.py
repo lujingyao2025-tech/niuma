@@ -232,8 +232,24 @@ def _compose_scope(page: Page, cancel_event: threading.Event | None = None) -> L
     return dialog if dialog is not None else page.locator("body")
 
 
+_BODY_SELECTORS = (
+    'div[contenteditable="true"][aria-label*="Message Body" i], '
+    'div[contenteditable="true"][aria-label*="邮件正文"], '
+    'div[contenteditable="true"][aria-label*="郵件正文"], '
+    'div[contenteditable="true"][aria-label*="郵件內文"], '
+    'div[contenteditable="true"][aria-label*="正文"]'
+)
+
+_BODY_FALLBACK_SELECTORS = (
+    'div[contenteditable="true"][aria-multiline="true"], '
+    'div[contenteditable="true"][role="textbox"], '
+    'div[contenteditable="true"]'
+)
+
+
 def _replace_compose_body(
     page: Page,
+    scope: Locator,
     body_box: Locator,
     body: str,
     cancel_event: threading.Event | None = None,
@@ -251,6 +267,24 @@ def _replace_compose_body(
     if _body_contains_marker(body_box, marker):
         return
 
+    # Gmail may replace the compose DOM after recipient/subject input. Re-locate
+    # the body once before falling back to keyboard input.
+    fresh_box = _visible_largest(scope.locator(_BODY_SELECTORS), 3000, cancel_event)
+    if fresh_box is None:
+        fresh_box = _visible_largest(
+            scope.locator(_BODY_FALLBACK_SELECTORS),
+            3000,
+            cancel_event,
+        )
+    if fresh_box is not None:
+        body_box = fresh_box
+        try:
+            body_box.fill(body, timeout=2000)
+        except (PlaywrightTimeoutError, PlaywrightError):
+            pass
+        if _body_contains_marker(body_box, marker):
+            return
+
     # Keyboard path for layouts that need a real focus/edit command first.
     try:
         body_box.evaluate("element => element.focus()", timeout=2000)
@@ -258,9 +292,9 @@ def _replace_compose_body(
         page.keyboard.press("Backspace")
         page.keyboard.insert_text(body)
     except (PlaywrightTimeoutError, PlaywrightError) as exc:
-        raise BrowserAutomationError(
-            "正文输入区已找到，但无法写入内容"
-        ) from exc
+        # The located element can disappear while Gmail re-renders; the prompt
+        # fallback below re-targets the compose body instead of failing here.
+        pass
     check_cancel(cancel_event)
     if _body_contains_marker(body_box, marker):
         return
@@ -281,9 +315,62 @@ def _replace_compose_body(
             timeout=2000,
         )
     except (PlaywrightTimeoutError, PlaywrightError):
-        return
+        pass
     if not _body_contains_marker(body_box, marker):
-        raise BrowserAutomationError("正文输入区已找到，但写入后未检测到邮件内容")
+        if _insert_body_via_prompt(page, scope, body, cancel_event):
+            return
+        raise BrowserAutomationError(
+            "正文输入区已找到，但写入后未检测到邮件内容"
+        )
+
+
+def _insert_body_via_prompt(
+    page: Page,
+    scope: Locator,
+    body: str,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """Click the compose body prompt (or body area) and type the draft body."""
+    check_cancel(cancel_event)
+    marker = next(
+        (line.strip() for line in body.splitlines() if line.strip()),
+        body.strip(),
+    )
+    body_prompt = _visible_last(
+        scope.get_by_text(
+            re.compile(
+                r"Press\s*/\s*for Help me write|撰写邮件|撰寫郵件",
+                re.I,
+            )
+        ),
+        3000,
+        cancel_event,
+    )
+    target = body_prompt
+    if target is None:
+        target = _visible_largest(
+            scope.locator(_BODY_FALLBACK_SELECTORS),
+            3000,
+            cancel_event,
+        )
+    if target is None:
+        return False
+    try:
+        target.click(timeout=2000)
+        page.keyboard.insert_text(body)
+    except (PlaywrightTimeoutError, PlaywrightError):
+        return False
+    try:
+        scope_text = str(
+            scope.evaluate(
+                "element => element.innerText || element.textContent || ''",
+                timeout=2000,
+            )
+            or ""
+        )
+    except (PlaywrightTimeoutError, PlaywrightError):
+        scope_text = ""
+    return bool(marker) and marker in scope_text
 
 
 def _body_contains_marker(body_box: Locator, marker: str) -> bool:
@@ -637,47 +724,24 @@ def _fill_open_compose(
     if timer is not None:
         timer.next("fill_body")
     body_box = _visible_largest(scope.locator(
-        'div[contenteditable="true"][aria-label*="Message Body" i], '
-        'div[contenteditable="true"][aria-label*="邮件正文"], '
-        'div[contenteditable="true"][aria-label*="郵件正文"], '
-        'div[contenteditable="true"][aria-label*="郵件內文"], '
-        'div[contenteditable="true"][aria-label*="正文"]'
+        _BODY_SELECTORS
     ), 4000, cancel_event)
     if body_box is None:
         # The body is the large third editable area. Choosing the largest visible
         # contenteditable avoids confusing it with compact recipient controls.
         body_box = _visible_largest(scope.locator(
-            'div[contenteditable="true"][aria-multiline="true"], '
-            'div[contenteditable="true"][role="textbox"], '
-            'div[contenteditable="true"]'
+            _BODY_FALLBACK_SELECTORS
         ), 3000, cancel_event)
     if body_box is not None:
-        _replace_compose_body(page, body_box, body, cancel_event)
+        _replace_compose_body(
+            page,
+            scope,
+            body_box,
+            body,
+            cancel_event,
+        )
     else:
-        body_prompt = _visible_last(scope.get_by_text(
-            re.compile(r"Press\s*/\s*for Help me write|撰写邮件|撰寫郵件", re.I)
-        ), 3000, cancel_event)
-        if body_prompt is None:
-            raise BrowserAutomationError("已填写收件人和主题，但找不到正文大输入框（第三个输入区）")
-        body_prompt.click()
-        page.keyboard.insert_text(body)
-        deadline = time.monotonic() + 2
-        scope_text = ""
-        while time.monotonic() < deadline:
-            check_cancel(cancel_event)
-            try:
-                scope_text = str(
-                    scope.evaluate(
-                        "element => element.innerText || element.textContent || ''"
-                    )
-                    or ""
-                )
-            except PlaywrightError:
-                scope_text = ""
-            if body.splitlines()[0].strip() in scope_text:
-                break
-            page.wait_for_timeout(100)
-        if body.splitlines()[0].strip() not in scope_text:
+        if not _insert_body_via_prompt(page, scope, body, cancel_event):
             raise BrowserAutomationError("正文区域已点击，但页面回读未检测到邮件内容")
     if timer is not None:
         timer.stop("fill_body")
